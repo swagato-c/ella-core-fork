@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/ellanetworks/core/internal/udm"
+	authmilenage "github.com/ellanetworks/core/internal/milenage"
 	"github.com/ellanetworks/core/internal/util/milenage"
 	"github.com/ellanetworks/core/internal/util/ueauth"
 	"github.com/ellanetworks/core/nas"
@@ -339,7 +339,7 @@ func (ue *UE) handleAuthenticationRequest(plain []byte) ([]byte, error) {
 	ik := make([]byte, 16)
 	ak := make([]byte, 6)
 
-	if err := udm.F2345(ue.OPc[:], ue.K[:], req.RAND[:], res, ck, ik, ak, nil); err != nil {
+	if err := authmilenage.F2345(ue.OPc[:], ue.K[:], req.RAND[:], res, ck, ik, ak, nil); err != nil {
 		return nil, fmt.Errorf("milenage f2345: %w", err)
 	}
 

@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/ellanetworks/core/internal/udm"
+	authmilenage "github.com/ellanetworks/core/internal/milenage"
 	"github.com/ellanetworks/core/nas"
 	"github.com/ellanetworks/core/nas/eps"
 )
@@ -117,14 +117,14 @@ func authenticationRequestFor(t *testing.T, ue *UE, sqn []byte) []byte {
 	}
 
 	res, ck, ik, ak, akStar := make([]byte, 8), make([]byte, 16), make([]byte, 16), make([]byte, 6), make([]byte, 6)
-	if err := udm.F2345(ue.OPc[:], ue.K[:], rand[:], res, ck, ik, ak, akStar); err != nil {
+	if err := authmilenage.F2345(ue.OPc[:], ue.K[:], rand[:], res, ck, ik, ak, akStar); err != nil {
 		t.Fatal(err)
 	}
 
 	amf := []byte{0x80, 0x00}
 	macA, macS := make([]byte, 8), make([]byte, 8)
 
-	if err := udm.F1(ue.OPc[:], ue.K[:], rand[:], sqn, amf, macA, macS); err != nil {
+	if err := authmilenage.F1(ue.OPc[:], ue.K[:], rand[:], sqn, amf, macA, macS); err != nil {
 		t.Fatal(err)
 	}
 
