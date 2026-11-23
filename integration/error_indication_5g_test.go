@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/ellanetworks/core/integration/suites"
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // TestIntegration5GErrorIndication runs the gnb error-indication scenario.

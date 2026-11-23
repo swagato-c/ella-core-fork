@@ -1,0 +1,253 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package s1enb
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/ellanetworks/core/s1ap"
+	"github.com/ellanetworks/core/tester/s1enb"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/spf13/pflag"
+)
+
+const (
+	s1hoIMSI      = "001017271246681"
+	s1hoSourceTun = "s1enbhosrc0"
+	s1hoTargetTun = "s1enbhotgt0"
+)
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "s1enb/s1_handover",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run:       runS1ENBHandover,
+		Fixture: func(_ scenarios.Env) scenarios.FixtureSpec {
+			return scenarios.FixtureSpec{
+				Subscribers:         []scenarios.SubscriberSpec{scenarios.DefaultSubscriberWith(s1hoIMSI, "")},
+				AssertUsageForIMSIs: []string{s1hoIMSI},
+			}
+		},
+	})
+}
+
+// Inter-eNB S1 handover (TS 36.413 §8.4, TS 23.401 §5.5.1.2.2). The MME switches
+// the UPF downlink to the target only at Handover Notify, so the pre-notify ping
+// must run via the source and the post-notify ping via the target.
+func runS1ENBHandover(ctx context.Context, env scenarios.Env, _ any) error {
+	return s1HandoverConnectivity(ctx, env, handoverConnectivityOpts{imsi: s1hoIMSI})
+}
+
+func s1HandoverConnectivity(ctx context.Context, env scenarios.Env, opts handoverConnectivityOpts) error {
+	if len(env.GNBs) < 2 {
+		return fmt.Errorf("s1_handover requires at least 2 eNB radios, got %d", len(env.GNBs))
+	}
+
+	s1mme, err := opts.mmeAddresses(env)
+	if err != nil {
+		return err
+	}
+
+	k, opc, err := defaultKeyAndOPc()
+	if err != nil {
+		return err
+	}
+
+	enbID, err := strconv.ParseUint(scenarios.DefaultGNBID, 16, 32)
+	if err != nil {
+		return fmt.Errorf("parse eNB ID %q: %w", scenarios.DefaultGNBID, err)
+	}
+
+	sourceSpec, targetSpec := env.GNBs[0], env.GNBs[1]
+
+	source, err := s1enb.Start(&s1enb.StartOpts{
+		ENBID: uint32(enbID), MCC: scenarios.DefaultMCC, MNC: scenarios.DefaultMNC, TAC: scenarios.DefaultTAC,
+		Name: "Source-S1eNB", CoreS1MMEAddresses: s1mme, ConnectAll: opts.connectAll,
+		ENBAddress: sourceSpec.N2Address, ENBN3Address: sourceSpec.N3Address, EnableDatapath: true,
+	})
+	if err != nil {
+		return fmt.Errorf("start source eNB: %w", err)
+	}
+
+	defer func() { _ = source.Close() }()
+
+	target, err := s1enb.Start(&s1enb.StartOpts{
+		ENBID: uint32(enbID) + 1, MCC: scenarios.DefaultMCC, MNC: scenarios.DefaultMNC, TAC: scenarios.DefaultTAC,
+		Name: "Target-S1eNB", CoreS1MMEAddresses: s1mme, ConnectAll: opts.connectAll,
+		ENBAddress: targetSpec.N2Address, ENBN3Address: targetSpec.N3Address, EnableDatapath: true,
+	})
+	if err != nil {
+		return fmt.Errorf("start target eNB: %w", err)
+	}
+
+	defer func() { _ = target.Close() }()
+
+	ue := source.NewUE(opts.imsi, k, opc)
+	ue.RequestPDNType(env.PDUSessionType())
+
+	res, err := source.Attach(ue, attachTimeout)
+	if err != nil {
+		return fmt.Errorf("attach on source eNB: %w", err)
+	}
+
+	sourceMME := source.ServingMMEAddress(res.ENBUES1APID)
+
+	sourceTunnel, err := handoverTunnelOpts(env, res, res.DLTEID, s1hoSourceTun)
+	if err != nil {
+		return err
+	}
+
+	if err := source.AddTunnel(sourceTunnel); err != nil {
+		return fmt.Errorf("add source GTP tunnel: %w", err)
+	}
+
+	if err := awaitHandoverTunnelReady(env, s1hoSourceTun); err != nil {
+		return err
+	}
+
+	if err := handoverProbe(ctx, env, s1hoSourceTun); err != nil {
+		return fmt.Errorf("ping before handover via source eNB: %w", err)
+	}
+
+	if err := source.SendHandoverRequired(res.ENBUES1APID, res.MMEUES1APID, target.GlobalENBID(), true); err != nil {
+		return fmt.Errorf("send Handover Required: %w", err)
+	}
+
+	hoReq, err := target.WaitForHandoverRequest(10 * time.Second)
+	if err != nil {
+		return fmt.Errorf("await Handover Request: %w", err)
+	}
+
+	if len(hoReq.ERABToBeSetup) != 1 {
+		return fmt.Errorf("handover request carried %d E-RABs, want 1", len(hoReq.ERABToBeSetup))
+	}
+
+	if err := assertSourceToTargetRelayed(hoReq); err != nil {
+		return err
+	}
+
+	// The MME assigns the target its own MME-UE-S1AP-ID (TS 36.413 §9.1.5.6),
+	// distinct from the source's; the target eNB echoes that one — not the source's
+	// — on the acknowledge and notify.
+	targetMMEUEID := int64(hoReq.MMEUES1APID)
+
+	targetENBUEID := target.AllocateENBUEIDFor(ue)
+
+	if hoReq.ERABToBeSetup[0].DataForwardingNotPossible != nil {
+		return fmt.Errorf("handover request declared data forwarding not possible despite a direct forwarding path")
+	}
+
+	dlTEID, fwdTEID, err := target.SendHandoverRequestAcknowledge(targetENBUEID, targetMMEUEID, res.ERABID, true)
+	if err != nil {
+		return fmt.Errorf("send Handover Request Acknowledge: %w", err)
+	}
+
+	cmd, err := source.WaitForHandoverCommand(res.ENBUES1APID, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("await Handover Command: %w", err)
+	}
+
+	if err := assertTargetToSourceRelayed(cmd); err != nil {
+		return err
+	}
+
+	if err := assertForwardingRelayed(cmd, res.ERABID, fwdTEID); err != nil {
+		return err
+	}
+
+	if err := source.SendENBStatusTransfer(res.MMEUES1APID, res.ENBUES1APID); err != nil {
+		return fmt.Errorf("send eNB Status Transfer: %w", err)
+	}
+
+	mst, err := target.WaitForMMEStatusTransfer(targetENBUEID, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("await MME Status Transfer: %w", err)
+	}
+
+	if err := assertStatusTransferRelayed(mst); err != nil {
+		return err
+	}
+
+	// The downlink must still run via the source before notify.
+	if err := handoverProbe(ctx, env, s1hoSourceTun); err != nil {
+		return fmt.Errorf("ping during handover preparation via source eNB (UPF switched too early?): %w", err)
+	}
+
+	if err := target.SendHandoverNotify(targetENBUEID, targetMMEUEID); err != nil {
+		return fmt.Errorf("send Handover Notify: %w", err)
+	}
+
+	if _, err := source.WaitForUEContextReleaseCommand(res.ENBUES1APID, 10*time.Second); err != nil {
+		return fmt.Errorf("await source UE Context Release Command: %w", err)
+	}
+
+	if err := source.SendUEContextReleaseComplete(res.MMEUES1APID, res.ENBUES1APID); err != nil {
+		return fmt.Errorf("send source UE Context Release Complete: %w", err)
+	}
+
+	if err := awaitEndMarker(func() int { return source.EndMarkerCount(res.DLTEID) }, "source eNB's old S1-U tunnel"); err != nil {
+		return err
+	}
+
+	source.CloseTunnel(res.DLTEID)
+
+	targetTunnel, err := handoverTunnelOpts(env, res, dlTEID, s1hoTargetTun)
+	if err != nil {
+		return err
+	}
+
+	if err := target.AddTunnel(targetTunnel); err != nil {
+		return fmt.Errorf("add target GTP tunnel: %w", err)
+	}
+
+	defer target.CloseTunnel(dlTEID)
+
+	if err := awaitHandoverTunnelReady(env, s1hoTargetTun); err != nil {
+		return err
+	}
+
+	if err := handoverProbe(ctx, env, s1hoTargetTun); err != nil {
+		return fmt.Errorf("ping after S1 handover via target eNB (UPF downlink not switched?): %w", err)
+	}
+
+	return opts.finish(ctx, env, sourceMME, target.ServingMMEAddress(targetENBUEID), res.UEIPv4, targetENBUEID)
+}
+
+func assertForwardingRelayed(cmd *s1ap.HandoverCommand, erabID s1ap.ERABID, fwdTEID uint32) error {
+	if len(cmd.ERABSubjecttoDataForwarding) != 1 {
+		return fmt.Errorf("handover command carried %d forwarding items, want 1", len(cmd.ERABSubjecttoDataForwarding))
+	}
+
+	item := cmd.ERABSubjecttoDataForwarding[0]
+	if item.ERABID != erabID {
+		return fmt.Errorf("forwarding item names E-RAB %d, want %d", item.ERABID, erabID)
+	}
+
+	if item.DLGTPTEID == nil || uint32(*item.DLGTPTEID) != fwdTEID {
+		return fmt.Errorf("forwarding item DL GTP-TEID = %v, want %#x", item.DLGTPTEID, fwdTEID)
+	}
+
+	if item.DLTransportLayerAddr == nil || item.DLTransportLayerAddr.IsZero() {
+		return fmt.Errorf("forwarding item carried no DL transport layer address")
+	}
+
+	return nil
+}
+
+func awaitEndMarker(count func() int, tunnel string) error {
+	deadline := time.Now().Add(10 * time.Second)
+
+	for time.Now().Before(deadline) {
+		if count() > 0 {
+			return nil
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("no GTP-U End Marker arrived on the %s after the path switch, so a forwarding tunnel behind it is never released", tunnel)
+}

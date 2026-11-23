@@ -1,0 +1,156 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package gnb
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/probe"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/spf13/pflag"
+	"go.uber.org/zap"
+)
+
+const natChecksumIMSI = "001010000000042"
+
+// natChecksumDefaultSizes spans small and large (>512 B) L4 datagrams so the
+// capture-verify test checks egress checksums across a range of sizes.
+const natChecksumDefaultSizes = "16,500,800,1300"
+
+type natChecksumParams struct {
+	PayloadBytes string
+}
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name: "gnb/nat_checksum",
+		BindFlags: func(fs *pflag.FlagSet) any {
+			p := &natChecksumParams{PayloadBytes: natChecksumDefaultSizes}
+			fs.StringVar(&p.PayloadBytes, "probe-payload-bytes", p.PayloadBytes,
+				"comma-separated L4 payload sizes to sweep for TCP and UDP probes")
+
+			return p
+		},
+		Run: func(ctx context.Context, env scenarios.Env, params any) error {
+			return runNATChecksum(ctx, env, params.(*natChecksumParams))
+		},
+		Fixture: func(scenarios.Env) scenarios.FixtureSpec {
+			return scenarios.FixtureSpec{
+				Subscribers: []scenarios.SubscriberSpec{
+					scenarios.DefaultSubscriberWith(natChecksumIMSI, ""),
+				},
+			}
+		},
+	})
+}
+
+func parsePayloadSizes(csv string) ([]int, error) {
+	parts := strings.Split(csv, ",")
+	sizes := make([]int, 0, len(parts))
+
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid payload size %q: %w", p, err)
+		}
+
+		if n < 0 {
+			return nil, fmt.Errorf("payload size must be non-negative, got %d", n)
+		}
+
+		sizes = append(sizes, n)
+	}
+
+	if len(sizes) == 0 {
+		return nil, fmt.Errorf("no payload sizes provided")
+	}
+
+	return sizes, nil
+}
+
+// runNATChecksum asserts only that the probes complete; the egress L4 checksum
+// is verified out-of-band by the integration test capturing post-NAT frames on N6.
+func runNATChecksum(ctx context.Context, env scenarios.Env, params *natChecksumParams) error {
+	sizes, err := parsePayloadSizes(params.PayloadBytes)
+	if err != nil {
+		return err
+	}
+
+	subs, err := buildSubscribers(1, natChecksumIMSI)
+	if err != nil {
+		return fmt.Errorf("could not build subscriber config: %v", err)
+	}
+
+	gNodeB, err := startGNB(env)
+	if err != nil {
+		return err
+	}
+
+	defer gNodeB.Close()
+
+	ranUENGAPID := int64(scenarios.DefaultRANUENGAPID)
+	tunInterfaceName := gtpInterfaceNamePrefix + "0"
+
+	newUE, err := newDefaultUE(gNodeB, subs[0].IMSI[5:], subs[0].Key, subs[0].OPc, subs[0].SequenceNumber, env.PDUSessionType())
+	if err != nil {
+		return fmt.Errorf("could not create UE: %v", err)
+	}
+
+	gNodeB.AddUE(ranUENGAPID, newUE)
+
+	registration, err := gNodeB.Register(newUE, ranUENGAPID, scenarios.DefaultPDUSessionID, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("initial registration procedure failed: %v", err)
+	}
+
+	session := registration.Session
+
+	ueIP := session.UEIPv4 + "/16"
+
+	err = gNodeB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           ueIP,
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: tunInterfaceName,
+		ULTEID:           session.ULTEID,
+		DLTEID:           session.DLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	})
+	if err != nil {
+		return fmt.Errorf("could not create GTP tunnel (name: %s, DL TEID: %d): %v", tunInterfaceName, session.DLTEID, err)
+	}
+
+	defer gNodeB.CloseTunnel(session.DLTEID)
+
+	dst := env.PingDestination()
+
+	for _, size := range sizes {
+		payload := probe.MakePayload(size)
+
+		if err := probe.SendTCP(ctx, tunInterfaceName, dst, scenarios.DefaultProbePort, probe.AttemptCount, probe.AttemptTimeout, payload); err != nil {
+			return fmt.Errorf("tcp probe (payload=%d) failed: %v", size, err)
+		}
+
+		if err := probe.SendUDP(ctx, tunInterfaceName, dst, scenarios.DefaultProbePort, probe.AttemptCount, probe.AttemptTimeout, payload); err != nil {
+			return fmt.Errorf("udp probe (payload=%d) failed: %v", size, err)
+		}
+
+		logger.Logger.Debug("nat_checksum probe sweep step complete",
+			zap.Int("payload_bytes", size),
+			zap.String("destination", dst),
+		)
+	}
+
+	return nil
+}

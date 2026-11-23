@@ -18,9 +18,9 @@ import (
 
 	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/integration/fixture"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 	// Side-effect import to register the HA failover scenarios.
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // runHA3GPPFailover drives the HA failover orchestration for the named

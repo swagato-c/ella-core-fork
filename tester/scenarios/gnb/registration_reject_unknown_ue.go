@@ -1,0 +1,96 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package gnb
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/ellanetworks/core/nas/fgs"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/testutil"
+	"github.com/ellanetworks/core/tester/ue"
+	"github.com/ellanetworks/core/tester/ue/sidf"
+	"github.com/spf13/pflag"
+)
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "gnb/registration_reject/unknown_ue",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run: func(ctx context.Context, env scenarios.Env, params any) error {
+			return runRegistrationRejectUnknownUE(ctx, env, params)
+		},
+		Fixture: fixtureRegistrationRejectUnknownUE,
+	})
+}
+
+func fixtureRegistrationRejectUnknownUE(env scenarios.Env) scenarios.FixtureSpec {
+	return scenarios.FixtureSpec{}
+}
+
+func runRegistrationRejectUnknownUE(_ context.Context, env scenarios.Env, _ any) error {
+	gNodeB, err := startGNB(env)
+	if err != nil {
+		return err
+	}
+
+	defer gNodeB.Close()
+
+	secCap := testutil.UeSecurityCapability{
+		Integrity: testutil.IntegrityAlgorithms{
+			Nia2: true,
+		},
+		Ciphering: testutil.CipheringAlgorithms{
+			Nea0: true,
+			Nea2: true,
+		},
+	}
+
+	newUEOpts := &ue.UEOpts{
+		GnodeB:         gNodeB,
+		PDUSessionType: fgs.PDUSessionType(env.PDUSessionType()),
+		Msin:           "1234567890",
+		K:              scenarios.DefaultKey,
+		OpC:            scenarios.DefaultOPC,
+		Amf:            scenarios.DefaultAMF,
+		Sqn:            scenarios.DefaultSequenceNumber,
+		Mcc:            scenarios.DefaultMCC,
+		Mnc:            scenarios.DefaultMNC,
+		HomeNetworkPublicKey: sidf.HomeNetworkPublicKey{
+			ProtectionScheme: sidf.NullScheme,
+			PublicKeyID:      "0",
+		},
+		RoutingIndicator:     scenarios.DefaultRoutingIndicator,
+		DNN:                  scenarios.DefaultDNN,
+		Sst:                  scenarios.DefaultSST,
+		Sd:                   scenarios.DefaultSD,
+		UeSecurityCapability: testutil.GetUESecurityCapability(&secCap),
+	}
+
+	newUE, err := ue.NewUE(newUEOpts)
+	if err != nil {
+		return fmt.Errorf("could not create UE: %v", err)
+	}
+
+	gNodeB.AddUE(int64(scenarios.DefaultRANUENGAPID), newUE)
+
+	err = newUE.SendRegistrationRequest(int64(scenarios.DefaultRANUENGAPID), uint8(fgs.RegistrationTypeInitial))
+	if err != nil {
+		return fmt.Errorf("could not send Registration Request: %v", err)
+	}
+
+	msg, err := newUE.WaitForNASGMMMessage(uint8(fgs.MsgRegistrationReject), 200*time.Millisecond)
+	if err != nil {
+		return fmt.Errorf("did not receive Registration Reject: %v", err)
+	}
+
+	err = validateRegistrationReject(msg, 3 /* 5GMM cause #3: Illegal UE */)
+	if err != nil {
+		return fmt.Errorf("NAS PDU validation failed: %v", err)
+	}
+
+	return nil
+}

@@ -12,8 +12,8 @@ import (
 	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/integration/fixture"
 	"github.com/ellanetworks/core/integration/suites"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	"github.com/ellanetworks/core/tester/scenarios"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // TestIntegration4GS1Handover runs the full inter-eNB S1 handover scenario with

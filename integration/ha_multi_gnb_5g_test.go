@@ -16,9 +16,9 @@ import (
 	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/integration/fixture"
 	"github.com/ellanetworks/core/integration/suites"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 	// Side-effect import to register the multi/cluster_traffic_5g scenario.
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // TestIntegration5GMultiGNB drives 3 gNBs (5 UEs each) against 3

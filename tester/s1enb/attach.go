@@ -1,0 +1,429 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package s1enb
+
+import (
+	"fmt"
+	"net/netip"
+	"time"
+
+	"github.com/ellanetworks/core/nas"
+	"github.com/ellanetworks/core/nas/eps"
+	"github.com/ellanetworks/core/per/ap"
+	"github.com/ellanetworks/core/s1ap"
+	"github.com/ellanetworks/core/tester/logger"
+	"go.uber.org/zap"
+)
+
+// AttachResult reports the identifiers and GUTI established by a completed attach.
+type AttachResult struct {
+	MMEUES1APID         int64
+	ENBUES1APID         int64
+	ERABID              s1ap.ERABID
+	GUTI                *eps.EPSMobileIdentity
+	AttachResultValue   eps.AttachResult
+	SecurityKey         s1ap.SecurityKey
+	UERadioCapability   []byte
+	UESecurityCaps      s1ap.UESecurityCapabilities
+	EMMCause            *eps.EMMCause
+	LAI                 *nas.LAI
+	SMSOnly             bool
+	IdentityRequested   bool
+	PDNType             eps.PDNType
+	ESMCause            *eps.ESMCause
+	QCI                 byte
+	ARP                 byte
+	PreemptCap          s1ap.PreemptionCapability
+	PreemptVuln         s1ap.PreemptionVulnerability
+	UEAmbrDownlinkBps   uint64
+	UEAmbrUplinkBps     uint64
+	APN                 string
+	SessAmbrDownlinkBps uint64
+	SessAmbrUplinkBps   uint64
+	UEIPv4              string // UE IPv4 assigned in the Attach Accept
+	UEIPv6              string // UE IPv6 link-local derived from the Attach Accept PDN IID
+	UpfAddress          string // S-GW/UPF S1-U address (uplink target)
+	BearerStatus        *nas.EPSBearerContextStatus
+	PCSCF               []netip.Addr
+	IMSVoPS             bool
+	ULTEID              uint32 // S-GW/UPF uplink TEID
+	DLTEID              uint32 // eNB downlink TEID reported to the MME
+}
+
+// Attach drives a full EPS attach for ue (TS 24.301 §5.5.1.2), returning once
+// Attach Complete is sent.
+func (e *ENB) Attach(ue *UE, timeout time.Duration) (*AttachResult, error) {
+	enbUEID, identityRequested, err := e.attachUntilSecured(ue, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return e.awaitAttachAccept(ue, enbUEID, identityRequested, timeout)
+}
+
+func (e *ENB) ReattachWithGUTI(ue *UE, guti *eps.EPSMobileIdentity, staleENBUEID int64, timeout time.Duration) (*AttachResult, error) {
+	if guti == nil {
+		return nil, fmt.Errorf("s1enb: a GUTI re-attach needs the GUTI of an earlier attach")
+	}
+
+	attachReq, err := ue.buildProtectedGUTIAttachRequest(guti)
+	if err != nil {
+		return nil, err
+	}
+
+	enbUEID := e.AllocateENBUEIDFor(ue)
+
+	if err := e.SendInitialUEMessage(enbUEID, attachReq); err != nil {
+		return nil, err
+	}
+
+	res, err := e.finishAttach(ue, enbUEID, false, timeout)
+	if err != nil {
+		return nil, err
+	}
+
+	if staleENBUEID != 0 {
+		if err := e.completeContextRelease(staleENBUEID, timeout); err != nil {
+			return nil, fmt.Errorf("release of the stale S1 connection: %w", err)
+		}
+	}
+
+	return res, nil
+}
+
+func (e *ENB) finishAttach(ue *UE, enbUEID int64, identityRequested bool, timeout time.Duration) (*AttachResult, error) {
+	if err := e.answerESMInformationRequest(ue, enbUEID, timeout); err != nil {
+		return nil, err
+	}
+
+	return e.awaitAttachAccept(ue, enbUEID, identityRequested, timeout)
+}
+
+func (e *ENB) awaitAttachAccept(ue *UE, enbUEID int64, identityRequested bool, timeout time.Duration) (*AttachResult, error) {
+	icsFrame, err := e.WaitForMessage(enbUEID, Initiating, s1ap.ProcInitialContextSetup, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("await Initial Context Setup Request: %w", err)
+	}
+
+	ics, err := s1ap.ParseInitialContextSetupRequest(icsFrame.Value)
+	if err != nil {
+		return nil, fmt.Errorf("parse Initial Context Setup Request: %w", err)
+	}
+
+	if len(ics.ERABToBeSetup) == 0 {
+		return nil, fmt.Errorf("initial context setup request without an E-RAB")
+	}
+
+	erab := ics.ERABToBeSetup[0]
+	mmeUEID := int64(ics.MMEUES1APID)
+
+	upf, err := e.selectUpfAddr(erab.TransportLayerAddress)
+	if err != nil {
+		return nil, err
+	}
+
+	dlTEID := e.allocTEID()
+
+	if e.claimCapabilityReport(enbUEID) {
+		if err := e.SendUECapabilityInfoIndication(mmeUEID, enbUEID, e.UERadioCapability); err != nil {
+			return nil, fmt.Errorf("send UE Capability Info Indication: %w", err)
+		}
+	}
+
+	if err := e.sendInitialContextSetupResponse(ics, enbUEID, dlTEID); err != nil {
+		return nil, err
+	}
+
+	acceptPlain, err := ue.unprotectDownlink([]byte(ics.ERABToBeSetup[0].NASPDU))
+	if err != nil {
+		return nil, fmt.Errorf("unprotect Attach Accept: %w", err)
+	}
+
+	accept, err := expectDownlink[*eps.AttachAccept](acceptPlain)
+	if err != nil {
+		return nil, fmt.Errorf("await Attach Accept: %w", err)
+	}
+
+	attachComplete, err := ue.buildAttachComplete(accept.ESMMessageContainer)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := e.SendUplinkNASTransport(mmeUEID, enbUEID, attachComplete); err != nil {
+		return nil, err
+	}
+
+	logger.GnbLogger.Debug("Attach complete",
+		zap.String("imsi", ue.IMSI), zap.Int64("mme_ue_s1ap_id", mmeUEID), zap.Int64("enb_ue_s1ap_id", enbUEID))
+
+	guti := accept.GUTI
+
+	ue.UseConnection(mmeUEID, enbUEID)
+
+	res := &AttachResult{
+		AttachResultValue: accept.EPSAttachResult,
+		SecurityKey:       ics.SecurityKey,
+		UERadioCapability: []byte(ics.UERadioCapability),
+		UESecurityCaps:    ics.UESecurityCapabilities,
+		EMMCause:          accept.Cause,
+		LAI:               accept.LAI,
+		SMSOnly:           accept.AdditionalUpdateResult != nil && *accept.AdditionalUpdateResult == eps.AdditionalUpdateResultSMSOnly,
+		MMEUES1APID:       mmeUEID,
+		ENBUES1APID:       enbUEID,
+		ERABID:            erab.ERABID,
+		GUTI:              guti,
+		IdentityRequested: identityRequested,
+		ARP:               erab.QoS.ARP.PriorityLevel,
+		PreemptCap:        erab.QoS.ARP.PreemptionCapability,
+		PreemptVuln:       erab.QoS.ARP.PreemptionVulnerability,
+		UEAmbrDownlinkBps: uint64(ics.UEAggregateMaximumBitRate.DL),
+		UEAmbrUplinkBps:   uint64(ics.UEAggregateMaximumBitRate.UL),
+		UpfAddress:        upf.Unmap().String(),
+		ULTEID:            uint32(erab.GTPTEID),
+		DLTEID:            dlTEID,
+		IMSVoPS:           accept.NetworkFeatureSupport != nil && accept.NetworkFeatureSupport.IMSVoPS,
+	}
+
+	if act, err := eps.ParseActivateDefaultEPSBearerContextRequest(accept.ESMMessageContainer); err == nil {
+		res.QCI = act.EPSQoS.QCI
+		res.ESMCause = act.Cause
+
+		res.APN = string(act.AccessPointName)
+
+		for _, pco := range []*nas.ProtocolConfigurationOptions{act.ProtocolConfigurationOptions, act.ExtendedProtocolConfigurationOptions} {
+			if pco != nil {
+				res.PCSCF = append(res.PCSCF, pco.PCSCFAddresses()...)
+			}
+		}
+
+		if act.APNAMBR != nil {
+			dlKbps, ulKbps, _ := act.APNAMBR.Kbps()
+			res.SessAmbrDownlinkBps, res.SessAmbrUplinkBps = dlKbps*1000, ulKbps*1000
+		}
+
+		{
+			pdn := act.PDNAddress
+			res.PDNType = eps.PDNType(uint8(pdn.PDNType))
+
+			if pdn.IPv4 != ([4]byte{}) {
+				res.UEIPv4 = netip.AddrFrom4(pdn.IPv4).String()
+			}
+
+			if pdn.IPv6IID != ([8]byte{}) {
+				// The PDN address carries only the interface identifier; the UE
+				// forms a link-local from it and obtains the global prefix via
+				// the UPF's Router Advertisement (SLAAC).
+				a := [16]byte{0: 0xfe, 1: 0x80}
+				copy(a[8:], pdn.IPv6IID[:])
+				res.UEIPv6 = netip.AddrFrom16(a).String()
+			}
+		}
+	}
+
+	return res, nil
+}
+
+func (e *ENB) attachUntilSecured(ue *UE, timeout time.Duration) (enbUEID int64, identityRequested bool, err error) {
+	enbUEID = e.AllocateENBUEIDFor(ue)
+
+	attachReq, err := ue.buildAttachRequest()
+	if err != nil {
+		return 0, false, err
+	}
+
+	if err := e.SendInitialUEMessage(enbUEID, attachReq); err != nil {
+		return 0, false, err
+	}
+
+	// An unresolvable GUTI draws an Identity Request first (TS 24.301 §5.4.4),
+	// answered with the IMSI.
+	downlink, mmeUEID, err := e.waitForPlainDownlink(enbUEID, timeout)
+	if err != nil {
+		return 0, false, fmt.Errorf("await Authentication/Identity Request: %w", err)
+	}
+
+	msg, err := parseDownlink(downlink)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if _, ok := msg.(*eps.IdentityRequest); ok {
+		identityRequested = true
+
+		idResp, err := ue.buildIdentityResponse()
+		if err != nil {
+			return 0, false, err
+		}
+
+		if err := e.SendUplinkNASTransport(mmeUEID, enbUEID, idResp); err != nil {
+			return 0, false, err
+		}
+
+		if downlink, _, err = e.WaitForDownlinkNAS(enbUEID, timeout); err != nil {
+			return 0, false, fmt.Errorf("await Authentication Request: %w", err)
+		}
+	}
+
+	for {
+		if _, err := expectDownlink[*eps.AuthenticationRequest](downlink); err != nil {
+			return 0, false, fmt.Errorf("await Authentication Request: %w", err)
+		}
+
+		authResp, err := ue.handleAuthenticationRequest(downlink)
+		if err != nil {
+			return 0, false, err
+		}
+
+		if err := e.SendUplinkNASTransport(mmeUEID, enbUEID, authResp); err != nil {
+			return 0, false, err
+		}
+
+		if !ue.resyncPending {
+			break
+		}
+
+		if downlink, _, err = e.WaitForDownlinkNAS(enbUEID, timeout); err != nil {
+			return 0, false, fmt.Errorf("await Authentication Request after the synch failure: %w", err)
+		}
+	}
+
+	smcWire, _, err := e.WaitForDownlinkNAS(enbUEID, timeout)
+	if err != nil {
+		return 0, false, fmt.Errorf("await Security Mode Command: %w", err)
+	}
+
+	smcComplete, err := ue.handleSecurityModeCommand(smcWire)
+	if err != nil {
+		return 0, false, err
+	}
+
+	if err := e.SendUplinkNASTransport(mmeUEID, enbUEID, smcComplete); err != nil {
+		return 0, false, err
+	}
+
+	if err := e.answerESMInformationRequest(ue, enbUEID, timeout); err != nil {
+		return 0, false, err
+	}
+
+	return enbUEID, identityRequested, nil
+}
+
+func (e *ENB) answerESMInformationRequest(ue *UE, enbUEID int64, timeout time.Duration) error {
+	if !ue.deferESMInfo {
+		return nil
+	}
+
+	esmReq, id, err := e.WaitForDownlinkNAS(enbUEID, timeout)
+	if err != nil {
+		return fmt.Errorf("await ESM Information Request: %w", err)
+	}
+
+	esmResp, err := ue.handleESMInformationRequest(esmReq)
+	if err != nil {
+		return err
+	}
+
+	return e.SendUplinkNASTransport(id, enbUEID, esmResp)
+}
+
+// waitForPlainDownlink returns the first plain (unprotected) downlink NAS,
+// skipping protected frames left from a prior UE on the same association (e.g.
+// the proactive EMM INFORMATION), which a fresh UE cannot decrypt. The first NAS
+// of an attach (Identity or Authentication Request) is always plain.
+func (e *ENB) waitForPlainDownlink(enbUEID int64, timeout time.Duration) (nas []byte, mmeUEID int64, err error) {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, 0, fmt.Errorf("s1enb: timeout waiting for a plain downlink NAS")
+		}
+
+		nas, mmeUEID, err = e.WaitForDownlinkNAS(enbUEID, remaining)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		if sht, err := eps.PeekSecurityHeaderType(nas); err == nil && sht == eps.SHTPlain {
+			return nas, mmeUEID, nil
+		}
+	}
+}
+
+// sendInitialContextSetupResponse acknowledges the bearer setup, reporting the
+// eNB's S1-U downlink endpoint (the F-TEID the MME hands to the UPF).
+func (e *ENB) sendInitialContextSetupResponse(ics *s1ap.InitialContextSetupRequest, enbUEID int64, dlTEID uint32) error {
+	addr := e.n3TransportLayerAddress()
+
+	resp := &s1ap.InitialContextSetupResponse{
+		MMEUES1APID: s1ap.Ptr(ics.MMEUES1APID),
+		ENBUES1APID: s1ap.Ptr(s1ap.ENBUES1APID(enbUEID)),
+		ERABSetup: []s1ap.ERABSetupItemCtxtSURes{{
+			ERABID:                ics.ERABToBeSetup[0].ERABID,
+			TransportLayerAddress: addr,
+			GTPTEID:               s1ap.GTPTEID(dlTEID),
+		}},
+	}
+
+	b, err := resp.Marshal()
+	if err != nil {
+		return fmt.Errorf("build Initial Context Setup Response: %w", err)
+	}
+
+	return e.SendMessage(b, true)
+}
+
+// selectUpfAddr resolves the UPF S1-U endpoint from the E-RAB Transport Layer
+// Address (TS 36.413): 32 bits IPv4, 128 IPv6, or 160 dual-stack (IPv4||IPv6).
+// For a dual-stack endpoint it picks the family of the eNB's own N3 socket, since
+// the GTP-U transport between eNB and UPF must share an address family.
+func (e *ENB) selectUpfAddr(tla s1ap.TransportLayerAddress) (netip.Addr, error) {
+	enbIsV6 := e.n3Addr.To4() == nil
+
+	if !tla.Valid() {
+		return netip.Addr{}, fmt.Errorf("s1enb: unexpected S1-U transport layer address length %d bits", tla.Bits())
+	}
+
+	v4, v6 := tla.IPv4(), tla.IPv6()
+
+	switch {
+	case enbIsV6 && v6.IsValid():
+		return v6.Unmap(), nil
+	case !enbIsV6 && v4.IsValid():
+		return v4.Unmap(), nil
+	case v4.IsValid():
+		return v4.Unmap(), nil
+	case v6.IsValid():
+		return v6.Unmap(), nil
+	default:
+		return netip.Addr{}, fmt.Errorf("s1enb: no usable S1-U transport address")
+	}
+}
+
+func (e *ENB) allocTEID() uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	t := e.nextTEID
+	e.nextTEID++
+
+	return t
+}
+
+func (e *ENB) allocForwardingTEID() uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	t := e.nextFwdTEID
+	e.nextFwdTEID++
+
+	return t
+}
+
+func (e *ENB) n3TransportLayerAddress() s1ap.TransportLayerAddress {
+	addr, _ := netip.AddrFromSlice(e.n3Addr)
+	tla, _ := ap.TransportLayerAddressFrom(addr)
+
+	return tla
+}

@@ -5,7 +5,7 @@ package fixture
 
 import (
 	"github.com/ellanetworks/core/client"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 )
 
 // ProfileSpec describes a subscriber profile (UE-AMBR bucket).

@@ -1,0 +1,157 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+// Package common holds tester scenario helpers shared across packages.
+package common
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"time"
+
+	"github.com/ellanetworks/core/nas/fgs"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/testutil"
+	"github.com/ellanetworks/core/tester/ue"
+	"github.com/ellanetworks/core/tester/ue/sidf"
+	"go.uber.org/zap"
+)
+
+const (
+	pduSessionType = fgs.PDUSessionTypeIPv4
+
+	registrationTimeout = 15 * time.Second
+)
+
+// RegisterAndPingOpts: Key/OpC/SQN/PDUSessionID default to
+// scenarios.Default* when zero; IMSI and TunInterfaceName are required.
+type RegisterAndPingOpts struct {
+	GNB              *gnb.GnodeB
+	RANUENGAPID      int64
+	PDUSessionID     uint8
+	IMSI             string
+	Key              string
+	OpC              string
+	SQN              string
+	TunInterfaceName string
+}
+
+// RegisterAndPing is safe to call concurrently for distinct UEs on the same gNB.
+func RegisterAndPing(ctx context.Context, opts *RegisterAndPingOpts) error {
+	_, err := RegisterAndPingUE(ctx, opts)
+
+	return err
+}
+
+func RegisterAndPingUE(ctx context.Context, opts *RegisterAndPingOpts) (*ue.UE, error) {
+	if opts.GNB == nil {
+		return nil, fmt.Errorf("GNB is required")
+	}
+
+	if len(opts.IMSI) < 5 {
+		return nil, fmt.Errorf("IMSI %q is too short", opts.IMSI)
+	}
+
+	if opts.TunInterfaceName == "" {
+		return nil, fmt.Errorf("TunInterfaceName is required")
+	}
+
+	key := opts.Key
+	if key == "" {
+		key = scenarios.DefaultKey
+	}
+
+	opc := opts.OpC
+	if opc == "" {
+		opc = scenarios.DefaultOPC
+	}
+
+	sqn := opts.SQN
+	if sqn == "" {
+		sqn = scenarios.DefaultSequenceNumber
+	}
+
+	pduID := opts.PDUSessionID
+	if pduID == 0 {
+		pduID = scenarios.DefaultPDUSessionID
+	}
+
+	newUE, err := ue.NewUE(&ue.UEOpts{
+		GnodeB:         opts.GNB,
+		PDUSessionID:   pduID,
+		PDUSessionType: pduSessionType,
+		Msin:           opts.IMSI[5:],
+		K:              key,
+		OpC:            opc,
+		Amf:            scenarios.DefaultAMF,
+		Sqn:            sqn,
+		Mcc:            scenarios.DefaultMCC,
+		Mnc:            scenarios.DefaultMNC,
+		HomeNetworkPublicKey: sidf.HomeNetworkPublicKey{
+			ProtectionScheme: sidf.NullScheme,
+			PublicKeyID:      "0",
+		},
+		RoutingIndicator: scenarios.DefaultRoutingIndicator,
+		DNN:              scenarios.DefaultDNN,
+		Sst:              scenarios.DefaultSST,
+		Sd:               scenarios.DefaultSD,
+		IMEISV:           scenarios.DefaultIMEISV,
+		UeSecurityCapability: testutil.GetUESecurityCapability(&testutil.UeSecurityCapability{
+			Integrity: testutil.IntegrityAlgorithms{
+				Nia2: true,
+			},
+			Ciphering: testutil.CipheringAlgorithms{
+				Nea0: true,
+				Nea2: true,
+			},
+		}),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create UE: %w", err)
+	}
+
+	opts.GNB.AddUE(opts.RANUENGAPID, newUE)
+
+	registration, err := opts.GNB.Register(newUE, opts.RANUENGAPID, pduID, registrationTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("initial registration: %w", err)
+	}
+
+	session := registration.Session
+
+	if err := opts.GNB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           session.UEIPv4 + "/16",
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: opts.TunInterfaceName,
+		ULTEID:           session.ULTEID,
+		DLTEID:           session.DLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	}); err != nil {
+		return nil, fmt.Errorf("create GTP tunnel %q: %w", opts.TunInterfaceName, err)
+	}
+
+	// #nosec G204 -- ping is fixed; tunInterfaceName is internally derived; PingDestination is a test constant
+	cmd := exec.CommandContext(ctx, "ping",
+		"-I", opts.TunInterfaceName,
+		scenarios.DefaultPingDestination,
+		"-c", "3",
+		"-W", "1",
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("ping via %s: %w\noutput:\n%s", opts.TunInterfaceName, err, string(out))
+	}
+
+	logger.Logger.Debug(
+		"ping ok",
+		zap.String("interface", opts.TunInterfaceName),
+		zap.String("imsi", opts.IMSI),
+	)
+
+	return newUE, nil
+}

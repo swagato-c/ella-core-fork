@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ellanetworks/core/internal/tester/gnb"
-	"github.com/ellanetworks/core/internal/tester/s1enb"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
-	"github.com/ellanetworks/core/internal/tester/ue"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/s1enb"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/ue"
 )
 
 const (

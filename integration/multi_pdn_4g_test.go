@@ -9,8 +9,8 @@ import (
 
 	"github.com/ellanetworks/core/integration/fixture"
 	"github.com/ellanetworks/core/integration/suites"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	"github.com/ellanetworks/core/tester/scenarios"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // TestIntegration4GMultiPDN drives a 4G UE through s1enb/connectivity_multi_pdn:

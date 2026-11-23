@@ -12,9 +12,9 @@ import (
 
 	"github.com/ellanetworks/core/integration/fixture"
 	"github.com/ellanetworks/core/integration/suites"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 	// Side-effect import to register every scenario.
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // scenariosSkipped lists scenarios the integration suite does not exercise,

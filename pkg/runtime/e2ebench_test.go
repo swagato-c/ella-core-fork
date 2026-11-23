@@ -11,9 +11,9 @@ import (
 	"time"
 
 	"github.com/ellanetworks/core/etsi"
-	"github.com/ellanetworks/core/internal/tester/gnb"
-	"github.com/ellanetworks/core/internal/tester/s1enb"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/s1enb"
+	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/ellanetworks/core/ngap"
 	"github.com/ellanetworks/core/s1ap"
 	"go.uber.org/goleak"

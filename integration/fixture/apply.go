@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/ellanetworks/core/client"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 )
 
 // Apply provisions every scenario-owned resource in spec and registers

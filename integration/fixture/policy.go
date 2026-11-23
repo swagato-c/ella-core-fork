@@ -5,7 +5,7 @@ package fixture
 
 import (
 	"github.com/ellanetworks/core/client"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 )
 
 // PolicySpec describes a QoS policy for a (profile, slice, data network)

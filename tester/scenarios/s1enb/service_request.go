@@ -1,0 +1,69 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package s1enb
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ellanetworks/core/tester/s1enb"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/spf13/pflag"
+)
+
+const serviceRequestIMSI = "001017271246612"
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "s1enb/service_request/data",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run:       runS1ENBServiceRequest,
+		Fixture: func(_ scenarios.Env) scenarios.FixtureSpec {
+			return scenarios.FixtureSpec{
+				Subscribers: []scenarios.SubscriberSpec{scenarios.DefaultSubscriberWith(serviceRequestIMSI, "")},
+			}
+		},
+	})
+}
+
+func runS1ENBServiceRequest(_ context.Context, env scenarios.Env, _ any) error {
+	k, opc, err := defaultKeyAndOPc()
+	if err != nil {
+		return err
+	}
+
+	e, err := startENB(env)
+	if err != nil {
+		return fmt.Errorf("start S1 eNB: %w", err)
+	}
+
+	defer func() { _ = e.Close() }()
+
+	ue := e.NewUE(serviceRequestIMSI, k, opc)
+	ue.RequestPDNType(env.PDUSessionType())
+
+	res, err := e.Attach(ue, attachTimeout)
+	if err != nil {
+		return fmt.Errorf("attach: %w", err)
+	}
+
+	if res.GUTI == nil {
+		return fmt.Errorf("attach completed without a GUTI, cannot service-request")
+	}
+
+	if err := e.ReleaseContext(res.MMEUES1APID, res.ENBUES1APID, s1enb.CauseUserInactivity, releaseTimeout); err != nil {
+		return fmt.Errorf("release to ECM-IDLE: %w", err)
+	}
+
+	sr, err := e.ServiceRequest(ue, res.GUTI, releaseTimeout, nil)
+	if err != nil {
+		return fmt.Errorf("service request: %w", err)
+	}
+
+	if sr.MMEUES1APID == res.MMEUES1APID {
+		return fmt.Errorf("MME reused the released MME-UE-S1AP-ID %d; expected a fresh one", sr.MMEUES1APID)
+	}
+
+	return nil
+}

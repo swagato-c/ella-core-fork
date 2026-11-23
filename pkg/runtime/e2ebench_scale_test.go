@@ -18,9 +18,9 @@ import (
 
 	"github.com/ellanetworks/core/internal/db"
 	"github.com/ellanetworks/core/internal/smf"
-	"github.com/ellanetworks/core/internal/tester/gnb"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
-	"github.com/ellanetworks/core/internal/tester/ue"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/ue"
 	"github.com/ellanetworks/core/nas/fgs"
 )
 

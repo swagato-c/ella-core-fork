@@ -1,0 +1,52 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package s1enb
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/spf13/pflag"
+)
+
+// unknownIMSI is not provisioned (no subscriber fixture), so the MME cannot
+// obtain an authentication vector for it.
+const unknownIMSI = "001017271246601"
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "s1enb/attach_reject/unknown_imsi",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run:       runS1ENBAttachRejectUnknownIMSI,
+	})
+}
+
+func runS1ENBAttachRejectUnknownIMSI(_ context.Context, env scenarios.Env, _ any) error {
+	k, opc, err := defaultKeyAndOPc()
+	if err != nil {
+		return err
+	}
+
+	e, err := startENB(env)
+	if err != nil {
+		return fmt.Errorf("start S1 eNB: %w", err)
+	}
+
+	defer func() { _ = e.Close() }()
+
+	ue := e.NewUE(unknownIMSI, k, opc)
+
+	cause, err := e.AttachExpectReject(ue, attachTimeout)
+	if err != nil {
+		return fmt.Errorf("attach: %w", err)
+	}
+
+	// EMM cause #3, Illegal UE (TS 24.301 §9.9.3.9).
+	if cause != 3 {
+		return fmt.Errorf("expected Attach Reject cause #3 (Illegal UE), got #%d", cause)
+	}
+
+	return nil
+}

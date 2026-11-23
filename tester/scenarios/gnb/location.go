@@ -1,0 +1,324 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package gnb
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/ellanetworks/core/client"
+	"github.com/ellanetworks/core/ngap"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios/common"
+	"github.com/spf13/pflag"
+	"go.uber.org/zap"
+)
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name: "ue/location",
+		BindFlags: func(fs *pflag.FlagSet) any {
+			p := &locationParams{}
+			fs.StringVar(&p.EllaAPIAddress, "ella-api-address", "", "Ella Core API address (e.g. http://10.3.0.2:5002)")
+			fs.StringVar(&p.EllaAPIToken, "ella-api-token", "", "Ella Core API token")
+
+			return p
+		},
+		Run: func(ctx context.Context, env scenarios.Env, params any) error {
+			p := params.(*locationParams)
+
+			return runLocationTest(ctx, env, p)
+		},
+		Fixture: fixtureLocation,
+	})
+}
+
+type locationParams struct {
+	EllaAPIAddress string
+	EllaAPIToken   string
+}
+
+func fixtureLocation(env scenarios.Env) scenarios.FixtureSpec {
+	return scenarios.FixtureSpec{
+		Subscribers: []scenarios.SubscriberSpec{scenarios.DefaultSubscriber()},
+	}
+}
+
+func runLocationTest(ctx context.Context, env scenarios.Env, p *locationParams) error {
+	if p.EllaAPIAddress == "" {
+		return fmt.Errorf("--ella-api-address is required for location scenario")
+	}
+
+	if p.EllaAPIToken == "" {
+		return fmt.Errorf("--ella-api-token is required for location scenario")
+	}
+
+	// Build Ella API client.
+	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	if err != nil {
+		return fmt.Errorf("failed to create Ella client: %v", err)
+	}
+
+	cl.SetToken(p.EllaAPIToken)
+
+	// Start gNB.
+	g := env.FirstGNB()
+
+	gNodeB, err := gnb.Start(&gnb.StartOpts{
+		GnbID:           scenarios.DefaultGNBID,
+		MCC:             scenarios.DefaultMCC,
+		MNC:             scenarios.DefaultMNC,
+		SST:             scenarios.DefaultSST,
+		SD:              scenarios.DefaultSD,
+		DNN:             scenarios.DefaultDNN,
+		TAC:             scenarios.DefaultTAC,
+		Name:            "Ella-Core-Tester",
+		CoreN2Addresses: env.CoreN2Addresses,
+		GnbN2Address:    g.N2Address,
+		GnbN3Address:    g.N3Address,
+	})
+	if err != nil {
+		return fmt.Errorf("error starting gNB: %v", err)
+	}
+
+	defer gNodeB.Close()
+
+	_, err = gNodeB.WaitForMessage(gnb.Successful, ngap.ProcNGSetup, scenarios.NGSetupTimeout)
+	if err != nil {
+		return fmt.Errorf("did not receive NG Setup Response: %v", err)
+	}
+
+	// Create UE and register.
+	ranUENGAPID := int64(scenarios.DefaultRANUENGAPID)
+
+	sub := subscriber{
+		IMSI:           scenarios.DefaultIMSI,
+		Key:            scenarios.DefaultKey,
+		OPc:            scenarios.DefaultOPC,
+		SequenceNumber: scenarios.DefaultSequenceNumber,
+	}
+
+	newUE, err := newDefaultUE(gNodeB, sub.IMSI[5:], sub.Key, sub.OPc, sub.SequenceNumber, env.PDUSessionType())
+	if err != nil {
+		return fmt.Errorf("could not create UE: %v", err)
+	}
+
+	gNodeB.AddUE(ranUENGAPID, newUE)
+
+	_, err = gNodeB.Register(newUE, ranUENGAPID, scenarios.DefaultPDUSessionID, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("initial registration failed: %v", err)
+	}
+
+	logger.Logger.Info(
+		"UE registered, proceeding to location tests",
+		zap.String("IMSI", sub.IMSI),
+		zap.Int64("RAN UE NGAP ID", ranUENGAPID),
+	)
+
+	// Extract SUPI from UE security context.
+	supi := newUE.UeSecurity.Supi
+
+	// --- Phase 1: E-CID location ---
+	// E-CID is anchored by the gNB's NG-RAN Access Point Position, so it yields
+	// a coordinate without any provisioning. Its response also carries the
+	// canonical serving NCGI we use to provision the cell-position table.
+	logger.Logger.Info("=== Testing E-CID location ===")
+
+	ecidResult, err := common.GetLocation(ctx, cl, supi, "ecid", "")
+	if err != nil {
+		return fmt.Errorf("E-CID location failed: %v", err)
+	}
+
+	if ecidResult.LocationEstimate == nil || ecidResult.LocationEstimate.Point == nil {
+		return fmt.Errorf("E-CID result missing locationEstimate point")
+	}
+
+	if ecidResult.Ncgi == nil {
+		return fmt.Errorf("E-CID result missing ncgi")
+	}
+
+	if err := validateNRECID(ecidResult); err != nil {
+		return err
+	}
+
+	logger.Logger.Info("E-CID location validated successfully",
+		zap.String("shape", ecidResult.LocationEstimate.Shape),
+		zap.Float64("lat", ecidResult.LocationEstimate.Point.Lat),
+		zap.Float64("lon", ecidResult.LocationEstimate.Point.Lon),
+	)
+
+	// --- Phase 2: provision the serving cell's position ---
+	logger.Logger.Info("=== Provisioning cell position ===",
+		zap.String("nrCellId", ecidResult.Ncgi.NrCellID))
+
+	if err := common.ProvisionCellPosition(ctx, cl, "nr", ecidResult.Ncgi.PlmnID.Mcc, ecidResult.Ncgi.PlmnID.Mnc, ecidResult.Ncgi.NrCellID); err != nil {
+		logger.Logger.Warn("cell position provisioning returned an error (may already exist)", zap.Error(err))
+	}
+
+	// --- Phase 3: Cell ID location ---
+	// With the cell position provisioned, Cell-ID resolves a coordinate from
+	// the table.
+	logger.Logger.Info("=== Testing Cell ID location ===")
+
+	cellIDResult, err := common.GetLocation(ctx, cl, supi, "cell_id", "")
+	if err != nil {
+		return fmt.Errorf("cell ID location failed: %v", err)
+	}
+
+	if cellIDResult.LocationEstimate == nil || cellIDResult.LocationEstimate.Point == nil {
+		return fmt.Errorf("cell ID result missing locationEstimate point (is the cell provisioned?)")
+	}
+
+	if m := common.PositioningMethod(cellIDResult); m != "CELLID" {
+		return fmt.Errorf("expected CELLID positioning method, got %q", m)
+	}
+
+	if cellIDResult.Ncgi == nil {
+		return fmt.Errorf("cell ID result missing NCGI")
+	}
+
+	logger.Logger.Info("Cell ID location validated successfully",
+		zap.String("shape", cellIDResult.LocationEstimate.Shape),
+		zap.Float64("lat", cellIDResult.LocationEstimate.Point.Lat),
+	)
+
+	// --- Phase 4: A-GNSS location ---
+	logger.Logger.Info("=== Testing A-GNSS location ===")
+
+	agnssResult, err := common.GetLocation(ctx, cl, supi, "gnss", "")
+	if err != nil {
+		return fmt.Errorf("A-GNSS location failed: %v", err)
+	}
+
+	if agnssResult.LocationEstimate == nil || agnssResult.LocationEstimate.Point == nil {
+		return fmt.Errorf("A-GNSS result missing locationEstimate point")
+	}
+
+	if g := common.GNSSPositioning(agnssResult); g != "GPS" {
+		return fmt.Errorf("expected a GPS positioning result, got %q", g)
+	}
+
+	// A-GNSS coordinates come from the UE tester: 45.0°N, 21.45°E.
+	if lat := agnssResult.LocationEstimate.Point.Lat; lat < 44.99 || lat > 45.01 {
+		return fmt.Errorf("A-GNSS latitude mismatch: expected ~45.0, got %f", lat)
+	}
+
+	if lon := agnssResult.LocationEstimate.Point.Lon; lon < 21.44 || lon > 21.46 {
+		return fmt.Errorf("A-GNSS longitude mismatch: expected ~21.45, got %f", lon)
+	}
+
+	logger.Logger.Info("A-GNSS location validated successfully")
+
+	if err := runPeriodicLocation(ctx, cl, supi); err != nil {
+		return err
+	}
+
+	// --- Cleanup: Deregister UE ---
+	pduSessionIDs := []uint8{scenarios.DefaultPDUSessionID}
+
+	err = gNodeB.ReleaseContext(newUE, ranUENGAPID, pduSessionIDs, gnb.CauseUserInactivity, releaseTimeout)
+	if err != nil {
+		return fmt.Errorf("UE context release failed: %v", err)
+	}
+
+	logger.Logger.Info("Location scenario completed successfully")
+
+	return nil
+}
+
+func validateNRECID(result *common.LocationData) error {
+	if !common.HasPositioning(result, "NR_ECID", "CONVENTIONAL", "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION") {
+		return fmt.Errorf("expected a network-based NR_ECID result that generated the location, got %+v", result.PositioningDataList)
+	}
+
+	if !common.HasPositioning(result, "NR_ECID", "UE_ASSISTED", "SUCCESS_RESULTS_NOT_USED") {
+		return fmt.Errorf("expected a successful UE-assisted NR_ECID result, got %+v", result.PositioningDataList)
+	}
+
+	if common.CountMeasurements(result, "NETWORK") == 0 || common.CountMeasurements(result, "UE") == 0 {
+		return fmt.Errorf("expected gNB and UE measurements, got %+v", result.RadioMeasurements)
+	}
+
+	for _, m := range result.RadioMeasurements {
+		if m.Serving && m.RAT != "NR" {
+			return fmt.Errorf("a %s cell is marked serving on NR access: %+v", m.RAT, result.RadioMeasurements)
+		}
+	}
+
+	return nil
+}
+
+func runPeriodicLocation(ctx context.Context, cl *client.Client, supi string) error {
+	const reports = 3
+
+	created, err := cl.CreateDeferredLocationRequest(ctx, &client.CreateDeferredLocationRequestOptions{
+		SUPI:              supi,
+		LdrType:           "PERIODIC",
+		PeriodicEventInfo: client.PeriodicEventInfo{ReportingAmount: reports, ReportingInterval: 2},
+		Method:            "ecid",
+		Mode:              "network_based",
+	})
+	if err != nil {
+		return fmt.Errorf("create periodic location request: %v", err)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	var request *client.DeferredLocationRequest
+
+	for {
+		request, err = cl.GetDeferredLocationRequest(ctx, created.ID)
+		if err != nil {
+			return fmt.Errorf("get periodic location request: %v", err)
+		}
+
+		if request.Status == "TERMINATED" {
+			break
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("periodic location request still %s after 30 s (%d reports)", request.Status, request.EventReportCounter)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if request.TerminationCause != "NORMAL_TERMINATION" || request.EventReportCounter != reports {
+		return fmt.Errorf("periodic location request ended with %s/%s after %d reports, want NORMAL_TERMINATION after %d",
+			request.TerminationCause, request.TerminationReason, request.EventReportCounter, reports)
+	}
+
+	list, err := cl.ListLocationReports(ctx, created.ID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("list location reports: %v", err)
+	}
+
+	if len(list.Items) != reports || list.Next != reports {
+		return fmt.Errorf("got %d location reports (next %d), want %d", len(list.Items), list.Next, reports)
+	}
+
+	for _, report := range list.Items {
+		var data common.LocationData
+		if err := json.Unmarshal(report.LocationData, &data); err != nil {
+			return fmt.Errorf("decode location report %d: %v", report.Seq, err)
+		}
+
+		if !common.HasPositioning(&data, "NR_ECID", "CONVENTIONAL", "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION") {
+			return fmt.Errorf("location report %d is not a network-based NR_ECID fix: %+v", report.Seq, data.PositioningDataList)
+		}
+	}
+
+	if err := cl.DeleteDeferredLocationRequest(ctx, created.ID); err != nil {
+		return fmt.Errorf("delete periodic location request: %v", err)
+	}
+
+	logger.Logger.Info("Periodic location validated successfully", zap.Int("reports", reports))
+
+	return nil
+}

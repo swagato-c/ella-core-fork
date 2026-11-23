@@ -1,0 +1,731 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package s1enb
+
+import (
+	"bytes"
+	"fmt"
+	"sync"
+	"sync/atomic"
+
+	"github.com/ellanetworks/core/internal/udm"
+	"github.com/ellanetworks/core/internal/util/milenage"
+	"github.com/ellanetworks/core/internal/util/ueauth"
+	"github.com/ellanetworks/core/nas"
+	"github.com/ellanetworks/core/nas/eps"
+	"github.com/ellanetworks/core/s1ap"
+	"github.com/ellanetworks/core/tester/smsue"
+)
+
+// EPS key-derivation FC values (TS 33.401 Annex A), as the hex strings
+// ueauth.GetKDFValue expects.
+const (
+	fcKASME           = "10" // §A.2
+	fcEPSAlgorithmKey = "15" // §A.7
+)
+
+const (
+	nasEncAlgDistinguisher byte = 0x01
+	nasIntAlgDistinguisher byte = 0x02
+)
+
+// defaultIMEISV is the UE's IMEISV, returned in SECURITY MODE COMPLETE when the
+// MME requests it.
+const defaultIMEISV eps.IMEISV = "3536083123456780"
+
+type UE struct {
+	IMSI                      string
+	K                         [16]byte
+	OPc                       [16]byte
+	plmn                      []byte                 // serving-network PLMN octets, for K_ASME derivation
+	netCapEEA                 nas.AlgorithmSet       // advertised EPS ciphering bitmap (UE network capability octet 3)
+	netCapEIA                 nas.AlgorithmSet       // advertised EPS integrity bitmap (octet 4)
+	pdnType                   eps.PDNType            // requested PDN type (eps.PDNTypeIPv4 / IPv6 / IPv4v6)
+	apn                       string                 // requested APN in the Attach Request ("" = subscriber default)
+	attachGUTI                *eps.EPSMobileIdentity // when set, the Attach Request presents this GUTI as the UE identity
+	n1Mode                    bool                   // gates the network's IWK N26 indication (TS 24.301 §5.5.1.2.4)
+	deferESMInfo              bool
+	detachGUTI                *eps.EPSMobileIdentity
+	attachType                eps.AttachType
+	requestType               eps.RequestType
+	pduSessionID              uint8 // sent in the PCO; 0 sends none
+	requestPCSCF              bool
+	kasme                     []byte
+	knasEnc                   [16]byte
+	knasInt                   [16]byte
+	sc                        *nas.SecurityContext
+	eea                       uint8
+	eia                       uint8
+	eksi                      uint8
+	ulCount                   uint8           // uplink NAS COUNT for protected uplink messages
+	dlCount                   downlinkCounter // largest downlink NAS COUNT accepted
+	kenbCount                 uint32
+	contextFromAuthentication bool
+	pti                       nas.ProcedureTransactionIdentity // last ESM procedure transaction identity used (attach uses 1)
+	netCapUEA                 nas.AlgorithmSet
+	netCapUIA                 nas.AlgorithmSet
+	msNetCap                  *eps.MSNetworkCapability
+	sentNetCap                eps.UENetworkCapability
+	sentMSNetCap              *eps.MSNetworkCapability
+	smsOnly                   bool
+	SMS                       *smsue.Stack
+	enb                       *ENB
+	nasMu                     sync.Mutex
+	mmeUEID                   atomic.Int64
+	enbUEID                   atomic.Int64
+	sqn                       []byte
+	resyncs                   int
+	resyncPending             bool
+	selectedPLMN              *s1ap.PLMNIdentity
+}
+
+func (e *ENB) NewUE(imsi string, k, opc [16]byte) *UE {
+	ue := &UE{
+		IMSI: imsi, K: k, OPc: opc, plmn: append([]byte(nil), e.plmn[:]...),
+		netCapEEA: 0xf0, netCapEIA: 0x70, pdnType: eps.PDNTypeIPv4, pti: 1,
+		netCapUEA: 0xc0, netCapUIA: 0x40,
+		msNetCap:   &eps.MSNetworkCapability{GEAExtended: 0x18, Rest: []byte{0x65, 0xb1, 0x3e}},
+		attachType: eps.AttachTypeEPS, requestType: eps.RequestTypeInitialRequest,
+		enb: e,
+	}
+
+	ue.SMS = smsue.New(ue.sendSMS)
+
+	return ue
+}
+
+// nextPTI allocates the next ESM procedure transaction identity for a UE-initiated
+// procedure (the attach PDN connectivity used 1, TS 24.301 §9.6).
+func (ue *UE) nextPTI() nas.ProcedureTransactionIdentity {
+	ue.pti++
+	if ue.pti == 0 {
+		ue.pti = 1
+	}
+
+	return ue.pti
+}
+
+// protectUplink integrity-protects and ciphers a plain uplink NAS message,
+// advancing the uplink NAS COUNT (TS 24.301).
+func (ue *UE) protectUplink(plain []byte) ([]byte, error) {
+	out, err := eps.Protect(plain, eps.SHTIntegrityProtectedCiphered,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, err
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+// RequestPDNType sets the PDN type the UE requests in its Attach Request
+// (eps.PDNTypeIPv4 / IPv6 / IPv4v6).
+func (ue *UE) RequestPDNType(t uint8) { ue.pdnType = eps.PDNType(t) }
+
+func (ue *UE) TrackSequenceNumber(sqn [6]byte) { ue.sqn = append([]byte(nil), sqn[:]...) }
+
+func (ue *UE) Resynchronisations() int { return ue.resyncs }
+
+// RequestAPN sets the APN the UE requests in its Attach Request's PDN Connectivity
+// Request (TS 24.301 §6.5.1.2); empty selects the subscriber's default APN.
+func (ue *UE) RequestAPN(apn string) { ue.apn = apn }
+
+func (ue *UE) DeferESMInformation() { ue.deferESMInfo = true }
+
+func (ue *UE) RequestPCSCFAddresses() { ue.requestPCSCF = true }
+
+func (ue *UE) RequestCombinedAttach() { ue.attachType = eps.AttachTypeCombined }
+
+func (ue *UE) DetachWithGUTI(guti *eps.EPSMobileIdentity) { ue.detachGUTI = guti }
+
+// UseUnknownGUTI makes the Attach Request present a GUTI the MME cannot resolve,
+// so the MME must obtain the IMSI with an IDENTITY REQUEST (TS 24.301 §5.4.4).
+func (ue *UE) UseUnknownGUTI() {
+	ue.attachGUTI = new(eps.GUTIIdentity(eps.GUTI{
+		PLMN: nas.PLMN{MCC: "001", MNC: "01"}, MMEGroupID: 0xffff, MMECode: 0xff, TMSI: [4]byte{0xde, 0xad, 0xbe, 0xef},
+	}))
+}
+
+// S1APSecurityCapabilities returns the UE's EPS algorithm capabilities in the
+// S1AP UESecurityCapabilities encoding: the EEA0/EIA0 bit is dropped, so the
+// octet is shifted left, matching how the MME stored them at attach.
+func (ue *UE) S1APSecurityCapabilities() s1ap.UESecurityCapabilities {
+	return s1ap.UESecurityCapabilities{
+		EncryptionAlgorithms:          s1ap.SecurityAlgorithms{Value: uint16(ue.netCapEEA<<1) << 8},
+		IntegrityProtectionAlgorithms: s1ap.SecurityAlgorithms{Value: uint16(ue.netCapEIA<<1) << 8},
+	}
+}
+
+func (ue *UE) MoveSessionFromNR(pduSessionID uint8) {
+	ue.requestType = eps.RequestTypeHandover
+	ue.pduSessionID = pduSessionID
+	ue.n1Mode = true
+}
+
+func (ue *UE) AnnounceN1Mode(pduSessionID uint8) {
+	ue.pduSessionID = pduSessionID
+	ue.n1Mode = true
+}
+
+func (ue *UE) buildAttachRequest() ([]byte, error) {
+	attach, err := ue.attachRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	return attach.MarshalBinary()
+}
+
+func (ue *UE) buildProtectedGUTIAttachRequest(guti *eps.EPSMobileIdentity) ([]byte, error) {
+	if ue.sc == nil {
+		return nil, fmt.Errorf("s1enb: a GUTI re-attach needs the EPS security context of an earlier attach")
+	}
+
+	attach, err := ue.attachRequest()
+	if err != nil {
+		return nil, err
+	}
+
+	attach.EPSMobileIdentity = *guti
+	attach.NASKeySetIdentifier = nas.KeySetIdentifier{Value: ue.eksi}
+
+	plain, err := attach.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	out, err := eps.Protect(plain, eps.SHTIntegrityProtected, nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Attach Request: %w", err)
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+func (ue *UE) attachRequest() (*eps.AttachRequest, error) {
+	pc := &eps.PDNConnectivityRequest{PTI: 1, RequestType: ue.requestType, PDNType: ue.pdnType}
+
+	if ue.deferESMInfo {
+		pc.ESMInformationTransferFlag = new(true)
+	}
+
+	if ue.apn != "" && !ue.deferESMInfo {
+		pc.AccessPointName = new(eps.APN(ue.apn))
+	}
+
+	if ue.pduSessionID != 0 || ue.requestPCSCF {
+		pco := nas.ProtocolConfigurationOptions{
+			ConfigProtocol: nas.PCOConfigProtocolPPP,
+			Direction:      nas.PCOMSToNetwork,
+		}
+
+		if ue.pduSessionID != 0 {
+			pco.Containers = append(pco.Containers, nas.PCOContainer{ID: nas.PCOContainerPDUSessionID, Content: []byte{ue.pduSessionID}})
+		}
+
+		if ue.requestPCSCF {
+			pco.Containers = append(pco.Containers,
+				nas.PCOContainer{ID: nas.PCOContainerPCSCFIPv6Address},
+				nas.PCOContainer{ID: nas.PCOContainerPCSCFIPv4Address},
+			)
+		}
+
+		pc.ProtocolConfigurationOptions = &pco
+	}
+
+	esm, err := pc.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build PDN Connectivity Request: %w", err)
+	}
+
+	identity := eps.IMSIIdentity(eps.IMSI(ue.IMSI))
+	if ue.attachGUTI != nil {
+		identity = *ue.attachGUTI
+	}
+
+	attachType := ue.attachType
+	if attachType == 0 {
+		attachType = eps.AttachTypeEPS
+	}
+
+	attach := &eps.AttachRequest{
+		EPSAttachType:       attachType,
+		NASKeySetIdentifier: nas.NoKeySet,
+		EPSMobileIdentity:   identity,
+		UENetworkCapability: *ue.advertise(ue.ueNetworkCapability(), nil),
+		ESMMessageContainer: esm,
+	}
+
+	if ue.smsOnly {
+		attach.AdditionalUpdateType = &eps.AdditionalUpdateType{AUTV: true}
+	}
+
+	return attach, nil
+}
+
+func (ue *UE) handleESMInformationRequest(wire []byte) ([]byte, error) {
+	plain, err := ue.unprotectDownlink(wire)
+	if err != nil {
+		return nil, fmt.Errorf("unprotect ESM Information Request: %w", err)
+	}
+
+	req, err := expectDownlink[*eps.ESMInformationRequest](plain)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &eps.ESMInformationResponse{PTI: req.PTI}
+	if ue.apn != "" {
+		resp.AccessPointName = new(eps.APN(ue.apn))
+	}
+
+	out, err := resp.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build ESM Information Response: %w", err)
+	}
+
+	return ue.protectUplink(out)
+}
+
+// buildIdentityResponse returns the IDENTITY RESPONSE carrying the UE's IMSI as
+// the mobile identity (TS 24.008 §10.5.1.4 coding), answering an MME IDENTITY
+// REQUEST for the IMSI.
+func (ue *UE) buildIdentityResponse() ([]byte, error) {
+	return (&eps.IdentityResponse{MobileIdentity: eps.MobileIMSI(eps.IMSI(ue.IMSI))}).MarshalBinary()
+}
+
+// handleAuthenticationRequest verifies nothing of the network (this is a test UE)
+// but computes RES from the challenge and derives K_ASME (TS 33.401 §A.2), then
+// returns the AUTHENTICATION RESPONSE NAS.
+func (ue *UE) handleAuthenticationRequest(plain []byte) ([]byte, error) {
+	req, err := eps.ParseAuthenticationRequest(plain)
+	if err != nil {
+		return nil, fmt.Errorf("parse Authentication Request: %w", err)
+	}
+
+	if len(req.AUTN) < 6 {
+		return nil, fmt.Errorf("AUTN too short: %d", len(req.AUTN))
+	}
+
+	ue.resyncPending = false
+
+	if ue.sqn != nil {
+		sqnHN, _, _, _, _, err := milenage.GenerateKeysWithAUTN(ue.OPc[:], ue.K[:], req.RAND[:], req.AUTN[:])
+		if err != nil {
+			return nil, fmt.Errorf("verify AUTN: %w", err)
+		}
+
+		if bytes.Compare(sqnHN, ue.sqn) <= 0 {
+			auts, err := milenage.GenerateAUTS(ue.OPc[:], ue.K[:], req.RAND[:], ue.sqn)
+			if err != nil {
+				return nil, fmt.Errorf("generate AUTS: %w", err)
+			}
+
+			ue.resyncs++
+			ue.resyncPending = true
+
+			return (&eps.AuthenticationFailure{Cause: eps.EMMCauseSynchFailure, AUTS: auts}).MarshalBinary()
+		}
+
+		ue.sqn = sqnHN
+	}
+
+	res := make([]byte, 8)
+	ck := make([]byte, 16)
+	ik := make([]byte, 16)
+	ak := make([]byte, 6)
+
+	if err := udm.F2345(ue.OPc[:], ue.K[:], req.RAND[:], res, ck, ik, ak, nil); err != nil {
+		return nil, fmt.Errorf("milenage f2345: %w", err)
+	}
+
+	// SQN ⊕ AK is the first six octets of AUTN.
+	sqnXorAK := append([]byte(nil), req.AUTN[:6]...)
+	key := append(append([]byte(nil), ck...), ik...)
+
+	kasme, err := ueauth.GetKDFValue(key, fcKASME, ue.plmn, ueauth.KDFLen(ue.plmn), sqnXorAK, ueauth.KDFLen(sqnXorAK))
+	if err != nil {
+		return nil, fmt.Errorf("derive K_ASME: %w", err)
+	}
+
+	ue.kasme = kasme
+	ue.contextFromAuthentication = true
+
+	return (&eps.AuthenticationResponse{RES: res}).MarshalBinary()
+}
+
+// handleSecurityModeCommand reads the selected algorithms from the (integrity-
+// protected, unciphered) SECURITY MODE COMMAND, derives the NAS keys, and returns
+// the protected SECURITY MODE COMPLETE carrying the UE's IMEISV.
+func (ue *UE) handleSecurityModeCommand(wire []byte) ([]byte, error) {
+	if len(wire) < 6 {
+		return nil, fmt.Errorf("security mode command too short: %d", len(wire))
+	}
+
+	// The command is integrity-protected with the new context but not ciphered,
+	// so the inner message is readable after the 6-octet security header.
+	smc, err := eps.ParseSecurityModeCommand(wire[6:])
+	if err != nil {
+		return nil, fmt.Errorf("parse Security Mode Command: %w", err)
+	}
+
+	if want := eps.ReplayedUESecurityCapability(ue.sentNetCap, ue.sentMSNetCap); !smc.ReplayedUESecurityCapability.Equal(want) {
+		return nil, fmt.Errorf("security mode command replays UE security capability %s, want the %s the UE advertised: "+
+			"a real UE answers Security Mode Reject with EMM cause #23 (TS 24.301 §5.4.3.5)",
+			smc.ReplayedUESecurityCapability, want)
+	}
+
+	ue.eea = uint8(smc.CipheringAlgorithm)
+	ue.eia = uint8(smc.IntegrityAlgorithm)
+	ue.eksi = smc.NASKeySetIdentifier.Value
+
+	if ue.contextFromAuthentication {
+		ue.ulCount = 0
+		ue.dlCount = downlinkCounter{}
+		ue.contextFromAuthentication = false
+	}
+
+	if err := ue.deriveNASKeys(); err != nil {
+		return nil, err
+	}
+
+	imeisv := eps.MobileIMEISV(defaultIMEISV)
+
+	complete, err := (&eps.SecurityModeComplete{IMEISV: &imeisv}).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Security Mode Complete: %w", err)
+	}
+
+	out, err := eps.Protect(complete, eps.SHTIntegrityProtectedCipheredNewContext,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Security Mode Complete: %w", err)
+	}
+
+	ue.kenbCount = uint32(ue.ulCount)
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+func (ue *UE) unprotectDownlink(wire []byte) ([]byte, error) {
+	m, err := eps.ParseSecurityProtectedMessage(wire)
+	if err != nil {
+		return nil, fmt.Errorf("parse protected downlink NAS: %w", err)
+	}
+
+	count := ue.dlCount.estimate(m.SequenceNumber)
+
+	if err := ue.dlCount.admissible(count); err != nil {
+		return nil, err
+	}
+
+	plain, _, err := eps.Unprotect(wire, count, nas.DirectionDownlink, ue.sc)
+	if err != nil {
+		return nil, err
+	}
+
+	ue.dlCount.accept(count)
+
+	return plain, nil
+}
+
+type downlinkCounter struct {
+	last     nas.Count
+	accepted bool
+	seen     uint64
+	floor    nas.Count
+	hasFloor bool
+}
+
+const (
+	sequenceHalfWindow = 128
+	replayWindow       = 64
+)
+
+func (d downlinkCounter) estimate(sqn uint8) nas.Count {
+	if !d.accepted {
+		return nas.MakeCount(0, sqn)
+	}
+
+	if int(sqn)-int(d.last.SQN()) < -sequenceHalfWindow {
+		return nas.MakeCount(d.last.Overflow()+1, sqn)
+	}
+
+	return nas.MakeCount(d.last.Overflow(), sqn)
+}
+
+func (d downlinkCounter) admissible(c nas.Count) error {
+	if d.hasFloor && c.Value() <= d.floor.Value() {
+		return fmt.Errorf("s1enb: downlink NAS COUNT %d was already spent when the security context was taken over (floor %d)",
+			c.Value(), d.floor.Value())
+	}
+
+	if !d.accepted || c.Value() > d.last.Value() {
+		return nil
+	}
+
+	behind := d.last.Value() - c.Value()
+	if behind >= replayWindow {
+		return fmt.Errorf("s1enb: downlink NAS COUNT %d is further behind %d than the replay window",
+			c.Value(), d.last.Value())
+	}
+
+	if d.seen&(1<<behind) != 0 {
+		return fmt.Errorf("s1enb: downlink NAS COUNT %d was already accepted (TS 24.301 §4.4.3.2)", c.Value())
+	}
+
+	return nil
+}
+
+func (d *downlinkCounter) accept(c nas.Count) {
+	if !d.accepted {
+		d.last, d.accepted, d.seen = c, true, 1
+
+		return
+	}
+
+	if ahead := c.Value(); ahead > d.last.Value() {
+		if shift := ahead - d.last.Value(); shift < replayWindow {
+			d.seen <<= shift
+		} else {
+			d.seen = 0
+		}
+
+		d.seen |= 1
+		d.last = c
+
+		return
+	}
+
+	if behind := d.last.Value() - c.Value(); behind < replayWindow {
+		d.seen |= 1 << behind
+	}
+}
+
+func (d *downlinkCounter) seed(c nas.Count) {
+	d.last, d.accepted, d.seen = c, true, 1
+	d.floor, d.hasFloor = c, true
+}
+
+func (ue *UE) buildAttachComplete(acceptESM []byte) ([]byte, error) {
+	activate, err := eps.ParseActivateDefaultEPSBearerContextRequest(acceptESM)
+	if err != nil {
+		return nil, fmt.Errorf("parse Activate Default EPS Bearer Context Request: %w", err)
+	}
+
+	esm, err := (&eps.ActivateDefaultEPSBearerContextAccept{
+		EPSBearerIdentity: activate.EPSBearerIdentity,
+		PTI:               activate.PTI,
+	}).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Activate Default EPS Bearer Context Accept: %w", err)
+	}
+
+	complete, err := (&eps.AttachComplete{ESMMessageContainer: esm}).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Attach Complete: %w", err)
+	}
+
+	out, err := eps.Protect(complete, eps.SHTIntegrityProtectedCiphered,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Attach Complete: %w", err)
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+// buildDetachRequest builds a protected UE-originating DETACH REQUEST (EPS
+// detach, not switch-off, TS 24.301 §8.2.11) so the network acknowledges it.
+func (ue *UE) buildDetachRequest() ([]byte, error) {
+	return ue.buildDetachRequestWith(false)
+}
+
+func (ue *UE) buildDetachRequestWith(switchOff bool) ([]byte, error) {
+	req := &eps.DetachRequestUE{
+		SwitchOff:           switchOff,
+		TypeOfDetach:        eps.DetachTypeEPS,
+		NASKeySetIdentifier: nas.KeySetIdentifier{},
+		EPSMobileIdentity:   eps.IMSIIdentity(eps.IMSI(ue.IMSI)),
+	}
+
+	if ue.detachGUTI != nil {
+		req.EPSMobileIdentity = *ue.detachGUTI
+		req.NASKeySetIdentifier = nas.KeySetIdentifier{Value: ue.eksi}
+	}
+
+	plain, err := req.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Detach Request: %w", err)
+	}
+
+	out, err := eps.Protect(plain, eps.SHTIntegrityProtectedCiphered,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Detach Request: %w", err)
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+// buildServiceRequest builds the 4-octet EPS SERVICE REQUEST (TS 24.301 §8.2.25):
+// the security-header/PD octet, the KSI plus the 5-bit truncated uplink sequence,
+// and the 2-octet short MAC over the first two octets at the current uplink NAS
+// COUNT. It advances the uplink COUNT, mirroring the MME.
+func (ue *UE) buildServiceRequest() ([]byte, error) {
+	sr, err := eps.NewServiceRequest(0, nas.MakeCount(0, ue.ulCount), ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("build Service Request: %w", err)
+	}
+
+	ue.ulCount++
+
+	return sr.MarshalBinary()
+}
+
+// buildTrackingAreaUpdateRequest builds a protected TRACKING AREA UPDATE REQUEST
+// of the given EPS update type (TS 24.301 §8.2.29); activeFlag requests the
+// network re-establish the radio bearer.
+func (ue *UE) buildTrackingAreaUpdateRequest(updateType eps.EPSUpdateType, activeFlag bool, guti *eps.EPSMobileIdentity) ([]byte, error) {
+	return ue.buildTrackingAreaUpdateRequestWithBearerStatus(updateType, activeFlag, guti, nil)
+}
+
+func (ue *UE) buildTrackingAreaUpdateRequestWithBearerStatus(updateType eps.EPSUpdateType, activeFlag bool,
+	guti *eps.EPSMobileIdentity, status *nas.EPSBearerContextStatus,
+) ([]byte, error) {
+	req := &eps.TrackingAreaUpdateRequest{
+		EPSUpdateType:          updateType,
+		ActiveFlag:             activeFlag,
+		OldGUTI:                *guti,
+		EPSBearerContextStatus: status,
+	}
+
+	if ue.smsOnly && (updateType == eps.EPSUpdateTypeCombinedTALA || updateType == eps.EPSUpdateTypeCombinedTALAIMSI) {
+		req.AdditionalUpdateType = &eps.AdditionalUpdateType{AUTV: true}
+	}
+
+	plain, err := req.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Tracking Area Update Request: %w", err)
+	}
+
+	out, err := eps.Protect(plain, eps.SHTIntegrityProtectedCiphered,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Tracking Area Update Request: %w", err)
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+// buildTrackingAreaUpdateComplete builds the protected TRACKING AREA UPDATE
+// COMPLETE that acknowledges a GUTI-reallocating TAU Accept (TS 24.301 §8.2.28).
+func (ue *UE) buildTrackingAreaUpdateComplete() ([]byte, error) {
+	plain, err := (&eps.TrackingAreaUpdateComplete{}).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("build Tracking Area Update Complete: %w", err)
+	}
+
+	out, err := eps.Protect(plain, eps.SHTIntegrityProtectedCiphered,
+		nas.MakeCount(0, ue.ulCount), nas.DirectionUplink, ue.sc)
+	if err != nil {
+		return nil, fmt.Errorf("protect Tracking Area Update Complete: %w", err)
+	}
+
+	ue.ulCount++
+
+	return out, nil
+}
+
+func (ue *UE) deriveNASKeys() error {
+	enc, err := deriveNASKey(ue.kasme, nasEncAlgDistinguisher, ue.eea)
+	if err != nil {
+		return fmt.Errorf("derive K_NASenc: %w", err)
+	}
+
+	intg, err := deriveNASKey(ue.kasme, nasIntAlgDistinguisher, ue.eia)
+	if err != nil {
+		return fmt.Errorf("derive K_NASint: %w", err)
+	}
+
+	ue.knasEnc, ue.knasInt = enc, intg
+
+	sc, err := nas.NewSecurityContext(nas.SecurityContextOptions{
+		Integrity:          nas.IntegrityAlgorithm(ue.eia),
+		Ciphering:          nas.CipheringAlgorithm(ue.eea),
+		IntegrityKey:       ue.knasInt,
+		CipherKey:          ue.knasEnc,
+		AllowNullIntegrity: nas.IntegrityAlgorithm(ue.eia) == nas.IntegrityNull,
+	})
+	if err != nil {
+		return fmt.Errorf("install NAS security context: %w", err)
+	}
+
+	ue.sc = sc
+
+	return nil
+}
+
+func deriveNASKey(kasme []byte, distinguisher, algID byte) ([16]byte, error) {
+	var k [16]byte
+
+	out, err := ueauth.GetKDFValue(kasme, fcEPSAlgorithmKey,
+		[]byte{distinguisher}, ueauth.KDFLen([]byte{distinguisher}),
+		[]byte{algID}, ueauth.KDFLen([]byte{algID}))
+	if err != nil {
+		return k, err
+	}
+
+	copy(k[:], out[16:32])
+
+	return k, nil
+}
+
+func (ue *UE) advertise(c eps.UENetworkCapability, ms *eps.MSNetworkCapability) *eps.UENetworkCapability {
+	ue.sentNetCap, ue.sentMSNetCap = c, ms
+
+	return &c
+}
+
+func (ue *UE) interworkingNetworkCapability() eps.UENetworkCapability {
+	return eps.UENetworkCapability{
+		EEA: ue.netCapEEA, EIA: ue.netCapEIA,
+		HasUMTS: true, UEA: ue.netCapUEA, UIA: ue.netCapUIA,
+		Rest: []byte{0x19},
+	}
+}
+
+func (ue *UE) interworkingExtraIEs() []nas.RawIE {
+	return []nas.RawIE{
+		{IEI: 0xA0, Format: nas.IETV1, After: 0x58, Value: []byte{0x01}},
+		{IEI: 0x90, Format: nas.IETV1, After: 0x31, Value: []byte{0x00}},
+		{IEI: 0xC0, Format: nas.IETV1, After: 0xE0, Value: []byte{0x01}},
+		{IEI: 0x11, Format: nas.IETLV, After: 0x31, Value: []byte{0x57, 0x58, 0xa6}},
+		{IEI: 0x20, Format: nas.IETLV, After: 0x31, Value: []byte{0x61, 0x14, 0x04, 0xe2, 0x91, 0x81, 0x40, 0x04, 0x80, 0x90}},
+		{IEI: 0x40, Format: nas.IETLV, After: 0x31, Value: []byte{0x04, 0x02, 0x60, 0x04, 0x00, 0x02, 0x1f, 0x02}},
+		{IEI: 0x5D, Format: nas.IETLV, After: 0x31, Value: []byte{0x03}},
+	}
+}
+
+func (ue *UE) ueNetworkCapability() eps.UENetworkCapability {
+	c := eps.UENetworkCapability{EEA: ue.netCapEEA, EIA: ue.netCapEIA}
+
+	if ue.n1Mode {
+		c.HasUMTS = true
+		c.Rest = []byte{0x00, 0x00, 0x20}
+	}
+
+	return c
+}

@@ -1,0 +1,286 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package gnb
+
+import (
+	"context"
+	"fmt"
+	"net/netip"
+	"time"
+
+	ngaplib "github.com/ellanetworks/core/ngap"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios/common"
+	"github.com/spf13/pflag"
+	"go.uber.org/zap"
+)
+
+const (
+	n2HandoverConnIMSI        = "001017271246591"
+	n2HandoverTunInterface    = "ellan2ho0"
+	n2HandoverTargetTunPrefix = "ellan2hot0"
+)
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "gnb/n2_handover_connectivity",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run:       runN2HandoverConnectivity,
+		Fixture:   fixtureN2HandoverConnectivity,
+	})
+}
+
+func fixtureN2HandoverConnectivity(_ scenarios.Env) scenarios.FixtureSpec {
+	return scenarios.FixtureSpec{
+		Subscribers: []scenarios.SubscriberSpec{
+			scenarios.DefaultSubscriberWith(n2HandoverConnIMSI, ""),
+		},
+		AssertUsageForIMSIs: []string{n2HandoverConnIMSI},
+	}
+}
+
+func runN2HandoverConnectivity(ctx context.Context, env scenarios.Env, _ any) error {
+	return n2HandoverConnectivity(ctx, env, handoverConnectivityOpts{imsi: n2HandoverConnIMSI})
+}
+
+func n2HandoverConnectivity(ctx context.Context, env scenarios.Env, opts handoverConnectivityOpts) error {
+	if len(env.GNBs) < 2 {
+		return fmt.Errorf("n2_handover_connectivity requires at least 2 gNBs, got %d", len(env.GNBs))
+	}
+
+	sourceGNBSpec := env.GNBs[0]
+	targetGNBSpec := env.GNBs[1]
+
+	sourceGNB, err := gnb.Start(&gnb.StartOpts{
+		GnbID:           "000001",
+		MCC:             scenarios.DefaultMCC,
+		MNC:             scenarios.DefaultMNC,
+		SST:             scenarios.DefaultSST,
+		SD:              scenarios.DefaultSD,
+		DNN:             scenarios.DefaultDNN,
+		TAC:             scenarios.DefaultTAC,
+		Name:            "Source-gNB",
+		CoreN2Addresses: env.CoreN2Addresses,
+		GnbN2Address:    sourceGNBSpec.N2Address,
+		GnbN3Address:    sourceGNBSpec.N3Address,
+		ConnectAll:      opts.connectAll,
+	})
+	if err != nil {
+		return fmt.Errorf("start source gNB: %w", err)
+	}
+
+	defer sourceGNB.Close()
+
+	if err := sourceGNB.AwaitNGSetup(2 * time.Second); err != nil {
+		return fmt.Errorf("source gNB: wait NGSetupResponse: %w", err)
+	}
+
+	targetGNB, err := gnb.Start(&gnb.StartOpts{
+		GnbID:           "000002",
+		MCC:             scenarios.DefaultMCC,
+		MNC:             scenarios.DefaultMNC,
+		SST:             scenarios.DefaultSST,
+		SD:              scenarios.DefaultSD,
+		DNN:             scenarios.DefaultDNN,
+		TAC:             scenarios.DefaultTAC,
+		Name:            "Target-gNB",
+		CoreN2Addresses: env.CoreN2Addresses,
+		GnbN2Address:    targetGNBSpec.N2Address,
+		GnbN3Address:    targetGNBSpec.N3Address,
+		ConnectAll:      opts.connectAll,
+	})
+	if err != nil {
+		return fmt.Errorf("start target gNB: %w", err)
+	}
+
+	defer targetGNB.Close()
+
+	if err := targetGNB.AwaitNGSetup(2 * time.Second); err != nil {
+		return fmt.Errorf("target gNB: wait NGSetupResponse: %w", err)
+	}
+
+	ranUENGAPID := int64(scenarios.DefaultRANUENGAPID)
+
+	newUE, err := newDefaultUE(sourceGNB, opts.imsi[5:], scenarios.DefaultKey, scenarios.DefaultOPC, scenarios.DefaultSequenceNumber, env.PDUSessionType())
+	if err != nil {
+		return fmt.Errorf("create UE: %w", err)
+	}
+
+	sourceGNB.AddUE(ranUENGAPID, newUE)
+
+	registration, err := sourceGNB.Register(newUE, ranUENGAPID, scenarios.DefaultPDUSessionID, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("initial registration: %w", err)
+	}
+
+	amfUENGAPID := sourceGNB.GetAMFUENGAPID(ranUENGAPID)
+	sourceAMF := sourceGNB.ServingAMFAddress(ranUENGAPID)
+
+	session := registration.Session
+
+	ueIP := handoverTunnelAddress(env, session)
+
+	err = sourceGNB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           ueIP,
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: n2HandoverTunInterface,
+		ULTEID:           session.ULTEID,
+		DLTEID:           session.DLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	})
+	if err != nil {
+		return fmt.Errorf("create source GTP tunnel: %w", err)
+	}
+
+	if err := awaitHandoverTunnelReady(env, n2HandoverTunInterface); err != nil {
+		return err
+	}
+
+	pingDest := env.PingDestination()
+	if err := handoverProbe(context.Background(), env, n2HandoverTunInterface); err != nil {
+		return fmt.Errorf("ping before handover failed: %w", err)
+	}
+
+	logger.Logger.Info("Ping successful before handover", zap.String("dest", pingDest))
+
+	err = sourceGNB.SendHandoverRequired(&gnb.HandoverRequiredOpts{
+		AMFUENGAPID:  amfUENGAPID,
+		RANUENGAPID:  ranUENGAPID,
+		HandoverType: ngaplib.HandoverTypeIntra5GS,
+		TargetGnbID:  "000002",
+		PDUSessions: []gnb.HandoverRequiredPDUSession{
+			{PDUSessionID: int64(scenarios.DefaultPDUSessionID)},
+		},
+		SourceToTargetTransparentContainer: n2SourceToTargetContainer,
+	})
+	if err != nil {
+		return fmt.Errorf("send HandoverRequired: %w", err)
+	}
+
+	hoReqFrame, err := targetGNB.WaitForMessage(
+		gnb.Initiating,
+		ngaplib.ProcHandoverResourceAllocation,
+		5*time.Second,
+	)
+	if err != nil {
+		return fmt.Errorf("target gNB: wait HandoverRequest: %w", err)
+	}
+
+	if err := assertSourceToTargetRelayed(hoReqFrame); err != nil {
+		return err
+	}
+
+	targetAmfUENGAPID, err := common.ExtractAmfUeNgapIDFromHandoverRequest(hoReqFrame.Data)
+	if err != nil {
+		return fmt.Errorf("extract AMF UE NGAP ID from HandoverRequest: %w", err)
+	}
+
+	targetRanUENGAPID := int64(100)
+	targetN3IP := netip.MustParseAddr(targetGNBSpec.N3Address)
+	targetDLTEID := uint32(9000)
+
+	if err := targetGNB.InheritSelectedPLMN(targetRanUENGAPID, sourceGNB, ranUENGAPID); err != nil {
+		return fmt.Errorf("carry the selected PLMN to the target gNB: %w", err)
+	}
+
+	err = targetGNB.SendHandoverRequestAcknowledge(&gnb.HandoverRequestAcknowledgeOpts{
+		AMFUENGAPID: targetAmfUENGAPID,
+		RANUENGAPID: targetRanUENGAPID,
+		PDUSessions: []gnb.HandoverAdmittedPDUSession{
+			{
+				PDUSessionID: int64(scenarios.DefaultPDUSessionID),
+				DLTEID:       targetDLTEID,
+				DLIP:         targetN3IP,
+			},
+		},
+		TargetToSourceTransparentContainer: n2HandoverRRCContainer,
+	})
+	if err != nil {
+		return fmt.Errorf("send HandoverRequestAcknowledge: %w", err)
+	}
+
+	hoCmdFrame, err := sourceGNB.WaitForMessage(
+		gnb.Successful,
+		ngaplib.ProcHandoverPreparation,
+		5*time.Second,
+	)
+	if err != nil {
+		return fmt.Errorf("source gNB: wait HandoverCommand: %w", err)
+	}
+
+	if err := assertN2HandoverCommand(hoCmdFrame, amfUENGAPID, ranUENGAPID); err != nil {
+		return err
+	}
+
+	if err := handoverProbe(context.Background(), env, n2HandoverTunInterface); err != nil {
+		return fmt.Errorf("ping during handover preparation via the source gNB (UPF switched too early?): %w", err)
+	}
+
+	err = targetGNB.SendHandoverNotify(&gnb.HandoverNotifyOpts{
+		AMFUENGAPID: targetAmfUENGAPID,
+		RANUENGAPID: targetRanUENGAPID,
+	})
+	if err != nil {
+		return fmt.Errorf("send HandoverNotify: %w", err)
+	}
+
+	_, err = sourceGNB.WaitForMessage(
+		gnb.Initiating,
+		ngaplib.ProcUEContextRelease,
+		5*time.Second,
+	)
+	if err != nil {
+		return fmt.Errorf("source gNB: wait UEContextReleaseCommand: %w", err)
+	}
+
+	if err := awaitEndMarker(func() int { return sourceGNB.EndMarkerCount(session.DLTEID) }, "source gNB's old N3 tunnel"); err != nil {
+		return err
+	}
+
+	sourceGNB.CloseTunnel(session.DLTEID)
+
+	err = targetGNB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           ueIP,
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: n2HandoverTargetTunPrefix,
+		ULTEID:           session.ULTEID,
+		DLTEID:           targetDLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	})
+	if err != nil {
+		return fmt.Errorf("create target GTP tunnel: %w", err)
+	}
+
+	// TS 23.502 §4.9.1.3.3: the UPF is updated with the new AN tunnel during
+	// handover completion, so downlink must flow through the target gNB.
+	if err := awaitHandoverTunnelReady(env, n2HandoverTargetTunPrefix); err != nil {
+		return err
+	}
+
+	if err := handoverProbe(context.Background(), env, n2HandoverTargetTunPrefix); err != nil {
+		return fmt.Errorf("ping after N2 handover FAILED (UPF not updated with new AN tunnel info): %w", err)
+	}
+
+	logger.Logger.Info("Ping successful after N2 handover", zap.String("dest", pingDest))
+
+	return opts.finish(ctx, env, sourceAMF, targetGNB.ServingAMFAddress(targetRanUENGAPID), session.UEIPv4, targetRanUENGAPID)
+}
+
+func awaitEndMarker(count func() int, tunnel string) error {
+	deadline := time.Now().Add(10 * time.Second)
+
+	for time.Now().Before(deadline) {
+		if count() > 0 {
+			return nil
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("no GTP-U End Marker arrived on the %s after the path switch, so a forwarding tunnel behind it is never released", tunnel)
+}

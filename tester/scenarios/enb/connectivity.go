@@ -1,0 +1,365 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package enb
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strconv"
+
+	"github.com/ellanetworks/core/nas/fgs"
+	"github.com/ellanetworks/core/ngap"
+	"github.com/ellanetworks/core/tester/enb"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/ellanetworks/core/tester/testutil"
+	"github.com/ellanetworks/core/tester/testutil/validate"
+	"github.com/ellanetworks/core/tester/ue"
+	"github.com/ellanetworks/core/tester/ue/sidf"
+	"github.com/spf13/pflag"
+	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
+)
+
+const (
+	enbGTPInterfaceNamePrefix  = "ellatesterenb"
+	enbNumConnectivityParallel = 5
+	enbTestStartIMSI           = "001017271246546"
+)
+
+type enbSubscriber struct {
+	IMSI           string
+	Key            string
+	OPc            string
+	SequenceNumber string
+}
+
+func buildEnbSubscribers(numSubscribers int, startIMSI string) ([]enbSubscriber, error) {
+	subs := make([]enbSubscriber, 0, numSubscribers)
+
+	for i := range numSubscribers {
+		intBaseIMSI, err := strconv.Atoi(startIMSI)
+		if err != nil {
+			return nil, fmt.Errorf("failed to convert base IMSI to int: %v", err)
+		}
+
+		newIMSI := intBaseIMSI + i
+		imsi := fmt.Sprintf("%0*d", len(startIMSI), newIMSI)
+
+		subs = append(subs, enbSubscriber{
+			IMSI:           imsi,
+			Key:            scenarios.DefaultKey,
+			OPc:            scenarios.DefaultOPC,
+			SequenceNumber: scenarios.DefaultSequenceNumber,
+		})
+	}
+
+	return subs, nil
+}
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "enb/connectivity",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run: func(ctx context.Context, env scenarios.Env, params any) error {
+			return runEnbConnectivity(ctx, env, params)
+		},
+		Fixture: fixtureEnbConnectivity,
+	})
+}
+
+func fixtureEnbConnectivity(env scenarios.Env) scenarios.FixtureSpec {
+	subs := make([]scenarios.SubscriberSpec, enbNumConnectivityParallel)
+	imsis := make([]string, enbNumConnectivityParallel)
+
+	for i := range enbNumConnectivityParallel {
+		imsi := enbIncrementIMSI(enbTestStartIMSI, i)
+		subs[i] = scenarios.DefaultSubscriberWith(imsi, "")
+		imsis[i] = imsi
+	}
+
+	return scenarios.FixtureSpec{
+		Subscribers:         subs,
+		AssertUsageForIMSIs: imsis,
+	}
+}
+
+func enbIncrementIMSI(base string, offset int) string {
+	var n uint64
+	for _, ch := range base {
+		n = n*10 + uint64(ch-'0')
+	}
+
+	n += uint64(offset)
+
+	out := make([]byte, 15)
+	for i := 14; i >= 0; i-- {
+		out[i] = byte('0' + n%10)
+		n /= 10
+	}
+
+	return string(out)
+}
+
+func runEnbConnectivity(ctx context.Context, env scenarios.Env, _ any) error {
+	subs, err := buildEnbSubscribers(enbNumConnectivityParallel, enbTestStartIMSI)
+	if err != nil {
+		return fmt.Errorf("could not build subscriber config: %v", err)
+	}
+
+	g := env.FirstGNB()
+
+	ngeNB, err := enb.Start(
+		scenarios.DefaultGNBID,
+		scenarios.DefaultMCC,
+		scenarios.DefaultMNC,
+		scenarios.DefaultSST,
+		scenarios.DefaultSD,
+		scenarios.DefaultDNN,
+		scenarios.DefaultTAC,
+		"Ella-Core-Tester-ENB",
+		env.FirstCore(),
+		g.N2Address,
+		g.N3Address,
+	)
+	if err != nil {
+		return fmt.Errorf("error starting eNB: %v", err)
+	}
+
+	defer ngeNB.Close()
+
+	_, err = ngeNB.WaitForMessage(gnb.Successful, ngap.ProcNGSetup, scenarios.NGSetupTimeout)
+	if err != nil {
+		return fmt.Errorf("did not receive SCTP frame: %v", err)
+	}
+
+	eg := errgroup.Group{}
+
+	for i := range enbNumConnectivityParallel {
+		func() {
+			eg.Go(func() error {
+				ranUENGAPID := int64(scenarios.DefaultRANUENGAPID) + int64(i)
+				tunInterfaceName := fmt.Sprintf(enbGTPInterfaceNamePrefix+"%d", i)
+
+				return runEnbConnectivityTest(
+					ctx,
+					ranUENGAPID,
+					ngeNB,
+					subs[i],
+					tunInterfaceName,
+				)
+			})
+		}()
+	}
+
+	err = eg.Wait()
+	if err != nil {
+		return fmt.Errorf("error during connectivity test: %v", err)
+	}
+
+	return nil
+}
+
+func runEnbConnectivityTest(
+	ctx context.Context,
+	ranUENGAPID int64,
+	ngeNB *enb.NgeNB,
+	subscriber enbSubscriber,
+	tunInterfaceName string,
+) error {
+	newUE, err := ue.NewUE(&ue.UEOpts{
+		GnodeB:         ngeNB.GnodeB,
+		PDUSessionID:   scenarios.DefaultPDUSessionID,
+		PDUSessionType: fgs.PDUSessionTypeIPv4,
+		Msin:           subscriber.IMSI[5:],
+		K:              subscriber.Key,
+		OpC:            subscriber.OPc,
+		Amf:            scenarios.DefaultAMF,
+		Sqn:            subscriber.SequenceNumber,
+		Mcc:            scenarios.DefaultMCC,
+		Mnc:            scenarios.DefaultMNC,
+		HomeNetworkPublicKey: sidf.HomeNetworkPublicKey{
+			ProtectionScheme: sidf.NullScheme,
+			PublicKeyID:      "0",
+		},
+		RoutingIndicator: scenarios.DefaultRoutingIndicator,
+		DNN:              scenarios.DefaultDNN,
+		Sst:              scenarios.DefaultSST,
+		Sd:               scenarios.DefaultSD,
+		IMEISV:           scenarios.DefaultIMEISV,
+		UeSecurityCapability: testutil.GetUESecurityCapability(&testutil.UeSecurityCapability{
+			Integrity: testutil.IntegrityAlgorithms{
+				Nia2: true,
+			},
+			Ciphering: testutil.CipheringAlgorithms{
+				Nea0: true,
+				Nea2: true,
+			},
+		}),
+	})
+	if err != nil {
+		return fmt.Errorf("could not create UE: %v", err)
+	}
+
+	ngeNB.AddUE(ranUENGAPID, newUE)
+
+	registration, err := ngeNB.Register(newUE, ranUENGAPID, scenarios.DefaultPDUSessionID, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("initial registration procedure failed: %v", err)
+	}
+
+	logger.Logger.Debug(
+		"Completed Initial Registration Procedure",
+		zap.String("IMSI", newUE.UeSecurity.Supi),
+		zap.Int64("RAN UE NGAP ID", ranUENGAPID),
+		zap.Int64("AMF UE NGAP ID", ngeNB.GetAMFUENGAPID(ranUENGAPID)),
+	)
+
+	session := registration.Session
+
+	ueIP := session.UEIPv4 + "/16"
+
+	err = validate.PDUSessionInformation(session, &validate.ExpectedPDUSessionInformation{
+		FiveQI: 9,
+		ARP:    15,
+		QFI:    1,
+	})
+	if err != nil {
+		return fmt.Errorf("NGAP QoS validation failed: %v", err)
+	}
+
+	err = ngeNB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           ueIP,
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: tunInterfaceName,
+		ULTEID:           session.ULTEID,
+		DLTEID:           session.DLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	})
+	if err != nil {
+		return fmt.Errorf("could not create GTP tunnel (name: %s, DL TEID: %d): %v", tunInterfaceName, session.DLTEID, err)
+	}
+
+	logger.GnbLogger.Debug(
+		"Created GTP Tunnel for PDU Session",
+		zap.String("IMSI", newUE.UeSecurity.Supi),
+		zap.String("Interface", tunInterfaceName),
+		zap.String("UE IP", ueIP),
+		zap.String("UPF IP", session.UpfAddress),
+		zap.Uint32("UL TEID", session.ULTEID),
+		zap.Uint32("DL TEID", session.DLTEID),
+	)
+
+	cmd := exec.CommandContext(ctx, "ping", "-I", tunInterfaceName, scenarios.DefaultPingDestination, "-c", "3", "-W", "1") // #nosec G204 -- ping is fixed; tunInterfaceName is internally derived; destination is test config
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ping %s via %s failed after initial registration: %v\noutput:\n%s", scenarios.DefaultPingDestination, tunInterfaceName, err, string(out))
+	}
+
+	logger.Logger.Debug(
+		"Ping successful",
+		zap.String("interface", tunInterfaceName),
+		zap.String("destination", scenarios.DefaultPingDestination),
+	)
+
+	pduSessionStatus := []uint8{scenarios.DefaultPDUSessionID}
+
+	err = ngeNB.ReleaseContext(newUE, ranUENGAPID, pduSessionStatus, gnb.CauseUserInactivity, releaseTimeout)
+	if err != nil {
+		return fmt.Errorf("UE context release procedure failed: %v", err)
+	}
+
+	logger.Logger.Debug(
+		"Completed UE Context Release Procedure",
+		zap.Int64("AMF UE NGAP ID", ngeNB.GetAMFUENGAPID(ranUENGAPID)),
+		zap.Int64("RAN UE NGAP ID", ranUENGAPID),
+	)
+
+	cmd = exec.CommandContext(ctx, "ping", "-I", tunInterfaceName, scenarios.DefaultPingDestination, "-c", "3", "-W", "1") // #nosec G204
+
+	out, err = cmd.CombinedOutput()
+	if err == nil {
+		return fmt.Errorf("ping %s via %s succeeded, but was expected to fail after UE Context Release\noutput:\n%s", scenarios.DefaultPingDestination, tunInterfaceName, string(out))
+	}
+
+	logger.Logger.Debug(
+		"Ping failed as expected after UE Context Release",
+		zap.String("interface", tunInterfaceName),
+		zap.String("destination", scenarios.DefaultPingDestination),
+	)
+
+	serviceRequest, err := ngeNB.ServiceRequest(newUE, ranUENGAPID, scenarios.DefaultPDUSessionID, registrationTimeout, nil)
+	if err != nil {
+		return fmt.Errorf("service request procedure failed: %v", err)
+	}
+
+	logger.Logger.Debug(
+		"Completed Service Request Procedure",
+		zap.String("IMSI", newUE.UeSecurity.Supi),
+		zap.Int64("RAN UE NGAP ID", ranUENGAPID),
+		zap.Int64("AMF UE NGAP ID", ngeNB.GetAMFUENGAPID(ranUENGAPID)),
+	)
+
+	ngeNB.CloseTunnel(session.DLTEID)
+
+	session = serviceRequest.Session
+
+	err = ngeNB.AddTunnel(&gnb.TunnelOpts{
+		UEIPv4:           ueIP,
+		UpfAddress:       session.UpfAddress,
+		TunInterfaceName: tunInterfaceName,
+		ULTEID:           session.ULTEID,
+		DLTEID:           session.DLTEID,
+		MTU:              session.MTU,
+		QFI:              session.QFI,
+	})
+	if err != nil {
+		return fmt.Errorf("could not create GTP tunnel after service request (name: %s, DL TEID: %d): %v", tunInterfaceName, session.DLTEID, err)
+	}
+
+	logger.GnbLogger.Debug(
+		"Created GTP Tunnel for PDU Session after Service Request",
+		zap.String("IMSI", newUE.UeSecurity.Supi),
+		zap.String("Interface", tunInterfaceName),
+		zap.String("UE IP", ueIP),
+		zap.String("UPF IP", session.UpfAddress),
+		zap.Uint32("UL TEID", session.ULTEID),
+		zap.Uint32("DL TEID", session.DLTEID),
+	)
+
+	cmd = exec.CommandContext(ctx, "ping", "-I", tunInterfaceName, scenarios.DefaultPingDestination, "-c", "3", "-W", "1") // #nosec G204
+
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ping %s via %s failed after service request: %v\noutput:\n%s", scenarios.DefaultPingDestination, tunInterfaceName, err, string(out))
+	}
+
+	logger.Logger.Debug(
+		"Ping successful after Service Request",
+		zap.String("interface", tunInterfaceName),
+		zap.String("destination", scenarios.DefaultPingDestination),
+	)
+
+	logger.Logger.Debug("client-side usage assertion skipped; integration test will verify",
+		zap.String("IMSI", subscriber.IMSI),
+	)
+
+	ngeNB.CloseTunnel(session.DLTEID)
+
+	logger.Logger.Debug(
+		"Closed GTP tunnel",
+		zap.String("interface", tunInterfaceName),
+	)
+
+	err = ngeNB.Deregister(newUE, ranUENGAPID, releaseTimeout)
+	if err != nil {
+		return fmt.Errorf("deregistration procedure failed: %v", err)
+	}
+
+	return nil
+}

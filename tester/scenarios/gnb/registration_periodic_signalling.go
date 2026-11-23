@@ -1,0 +1,90 @@
+// SPDX-FileCopyrightText: Ella Networks Inc.
+// SPDX-License-Identifier: BUSL-1.1
+
+package gnb
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/ellanetworks/core/nas/fgs"
+	"github.com/ellanetworks/core/ngap"
+	"github.com/ellanetworks/core/tester/gnb"
+	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/scenarios"
+	"github.com/spf13/pflag"
+)
+
+func init() {
+	scenarios.Register(scenarios.Scenario{
+		Name:      "gnb/registration/periodic/signalling",
+		BindFlags: func(fs *pflag.FlagSet) any { return struct{}{} },
+		Run: func(ctx context.Context, env scenarios.Env, params any) error {
+			return runRegistrationPeriodicSignalling(ctx, env, params)
+		},
+		Fixture: fixtureRegistrationPeriodicSignalling,
+	})
+}
+
+func fixtureRegistrationPeriodicSignalling(env scenarios.Env) scenarios.FixtureSpec {
+	return scenarios.FixtureSpec{
+		Subscribers: []scenarios.SubscriberSpec{scenarios.DefaultSubscriber()},
+	}
+}
+
+func runRegistrationPeriodicSignalling(_ context.Context, env scenarios.Env, _ any) error {
+	gNodeB, err := startGNB(env)
+	if err != nil {
+		return err
+	}
+
+	defer gNodeB.Close()
+
+	newUE, err := newDefaultUE(gNodeB, scenarios.DefaultIMSI[5:], scenarios.DefaultKey, scenarios.DefaultOPC, scenarios.DefaultSequenceNumber, env.PDUSessionType())
+	if err != nil {
+		return fmt.Errorf("could not create UE: %v", err)
+	}
+
+	gNodeB.AddUE(int64(scenarios.DefaultRANUENGAPID), newUE)
+
+	_, err = gNodeB.Register(newUE, int64(scenarios.DefaultRANUENGAPID), scenarios.DefaultPDUSessionID, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("InitialRegistrationProcedure failed: %v", err)
+	}
+
+	_, err = gNodeB.WaitForMessage(gnb.Initiating, ngap.ProcPDUSessionResourceSetup, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("did not receive SCTP frame: %v", err)
+	}
+
+	pduSessionStatus := []uint8{scenarios.DefaultPDUSessionID}
+
+	err = gNodeB.ReleaseContext(newUE, int64(scenarios.DefaultRANUENGAPID), pduSessionStatus, gnb.CauseUserInactivity, releaseTimeout)
+	if err != nil {
+		return fmt.Errorf("UEContextReleaseProcedure failed: %v", err)
+	}
+
+	err = newUE.SendRegistrationRequest(int64(scenarios.DefaultRANUENGAPID), uint8(fgs.RegistrationTypePeriodicUpdating))
+	if err != nil {
+		return fmt.Errorf("could not send Registration Request for periodic update: %v", err)
+	}
+
+	_, err = newUE.WaitForNASGMMMessage(uint8(fgs.MsgRegistrationAccept), registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("did not receive Registration Accept for periodic update: %v", err)
+	}
+
+	_, err = gNodeB.WaitForMessage(gnb.Initiating, ngap.ProcPDUSessionResourceSetup, registrationTimeout)
+	if err != nil {
+		return fmt.Errorf("did not receive SCTP frame: %v", err)
+	}
+
+	logger.UeLogger.Debug("Received Registration Accept for periodic update")
+
+	err = gNodeB.Deregister(newUE, int64(scenarios.DefaultRANUENGAPID), releaseTimeout)
+	if err != nil {
+		return fmt.Errorf("DeregistrationProcedure failed: %v", err)
+	}
+
+	return nil
+}

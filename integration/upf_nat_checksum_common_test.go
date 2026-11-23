@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/ellanetworks/core/integration/fixture"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	"github.com/ellanetworks/core/tester/scenarios"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"

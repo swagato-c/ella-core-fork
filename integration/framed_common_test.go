@@ -9,9 +9,9 @@ import (
 	"testing"
 
 	"github.com/ellanetworks/core/integration/fixture"
-	"github.com/ellanetworks/core/internal/tester/scenarios"
+	"github.com/ellanetworks/core/tester/scenarios"
 	// Side-effect import to register every scenario.
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // runFramedSuite brings up the core-tester compose, disables NAT (framed routes

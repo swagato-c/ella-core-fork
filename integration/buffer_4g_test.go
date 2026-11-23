@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/ellanetworks/core/integration/suites"
-	_ "github.com/ellanetworks/core/internal/tester/scenarios/all"
+	_ "github.com/ellanetworks/core/tester/scenarios/all"
 )
 
 // TestIntegration4GBufferedDownlink runs the s1enb buffered-downlink scenario.
