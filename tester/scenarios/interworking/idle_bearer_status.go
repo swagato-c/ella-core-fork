@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/etsi"
 	"github.com/ellanetworks/core/nas"
 	"github.com/ellanetworks/core/nas/eps"
@@ -218,7 +217,7 @@ func assertSessionCount(ctx context.Context, env scenarios.Env, want int, stage 
 	var got int
 
 	for {
-		sub, err := cl.GetSubscriber(ctx, &client.GetSubscriberOptions{ID: interworkingIMSI})
+		sub, err := cl.Subscriber(ctx, interworkingIMSI)
 		if err == nil {
 			got = len(sub.Sessions)
 			if got == want {

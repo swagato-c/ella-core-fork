@@ -10,11 +10,11 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas/fgs"
 	"github.com/ellanetworks/core/ngap"
 	"github.com/ellanetworks/core/tester/gnb"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/ellanetworks/core/tester/testutil/validate"
 	"github.com/spf13/pflag"
@@ -114,12 +114,10 @@ func runSessionModification(ctx context.Context, env scenarios.Env, p *sessionMo
 		return fmt.Errorf("--ella-api-token is required for session modification scenario")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -184,7 +182,8 @@ func runSessionModification(ctx context.Context, env scenarios.Env, p *sessionMo
 		apiArp = 15
 	}
 
-	updateOpts := &client.UpdatePolicyOptions{
+	updateOpts := provisioning.Policy{
+		Name:                scenarios.DefaultPolicyName,
 		ProfileName:         scenarios.DefaultProfileName,
 		SliceName:           scenarios.DefaultSliceName,
 		DataNetworkName:     scenarios.DefaultDNN,
@@ -194,14 +193,15 @@ func runSessionModification(ctx context.Context, env scenarios.Env, p *sessionMo
 		Arp:                 apiArp,
 	}
 
-	err = cl.UpdatePolicy(ctx, scenarios.DefaultPolicyName, updateOpts)
+	err = cl.UpdatePolicy(ctx, updateOpts)
 	if err != nil {
 		return fmt.Errorf("failed to update policy: %v", err)
 	}
 
 	// Restore the original policy so later scenarios see default values.
 	defer func() {
-		_ = cl.UpdatePolicy(ctx, scenarios.DefaultPolicyName, &client.UpdatePolicyOptions{
+		_ = cl.UpdatePolicy(ctx, provisioning.Policy{
+			Name:                scenarios.DefaultPolicyName,
 			ProfileName:         scenarios.DefaultProfileName,
 			SliceName:           scenarios.DefaultSliceName,
 			DataNetworkName:     scenarios.DefaultDNN,

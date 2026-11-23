@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas"
 	"github.com/ellanetworks/core/nas/eps"
 	"github.com/ellanetworks/core/s1ap"
@@ -53,12 +52,10 @@ func runS1ENBPaging(ctx context.Context, env scenarios.Env, p *pagingParams) err
 		return fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := scenarios.EllaCoreClient(ctx, p.EllaAPIAddress, p.EllaAPIToken)
 	if err != nil {
-		return fmt.Errorf("create Ella client: %w", err)
+		return fmt.Errorf("reach Ella Core API: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	k, opc, err := defaultKeyAndOPc()
 	if err != nil {

@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas/eps"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/s1enb"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
@@ -88,12 +88,10 @@ func runSessionModification(ctx context.Context, env scenarios.Env, p *sessionMo
 		return fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %w", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	k, opc, err := defaultKeyAndOPc()
 	if err != nil {
@@ -130,13 +128,13 @@ func runSessionModification(ctx context.Context, env scenarios.Env, p *sessionMo
 	want := defaultSessionModPolicy()
 	applySessionModConfig(&want, cfg)
 
-	if err := cl.UpdatePolicy(ctx, scenarios.DefaultPolicyName, &want); err != nil {
+	if err := cl.UpdatePolicy(ctx, want); err != nil {
 		return fmt.Errorf("update policy: %w", err)
 	}
 
 	defer func() {
 		restore := defaultSessionModPolicy()
-		_ = cl.UpdatePolicy(context.Background(), scenarios.DefaultPolicyName, &restore)
+		_ = cl.UpdatePolicy(context.Background(), restore)
 	}()
 
 	logger.GnbLogger.Info("policy updated; awaiting session modification",
@@ -214,8 +212,9 @@ func assertModifyAPNAMBR(nasReq *eps.ModifyEPSBearerContextRequest, cfg sessionM
 	return nil
 }
 
-func defaultSessionModPolicy() client.UpdatePolicyOptions {
-	return client.UpdatePolicyOptions{
+func defaultSessionModPolicy() provisioning.Policy {
+	return provisioning.Policy{
+		Name:                scenarios.DefaultPolicyName,
 		ProfileName:         scenarios.DefaultProfileName,
 		SliceName:           scenarios.DefaultSliceName,
 		DataNetworkName:     scenarios.DefaultDNN,
@@ -226,7 +225,7 @@ func defaultSessionModPolicy() client.UpdatePolicyOptions {
 	}
 }
 
-func applySessionModConfig(opts *client.UpdatePolicyOptions, cfg sessionModConfig) {
+func applySessionModConfig(opts *provisioning.Policy, cfg sessionModConfig) {
 	if cfg.ambrUplinkMbps != 0 {
 		opts.SessionAmbrUplink = fmt.Sprintf("%d Mbps", cfg.ambrUplinkMbps)
 	}

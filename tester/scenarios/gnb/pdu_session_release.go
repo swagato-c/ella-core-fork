@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/internal/models"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
@@ -107,19 +107,17 @@ func runPDUSessionRelease(ctx context.Context, env scenarios.Env, _ any) error {
 // so the assertion covers what the SMF did with its context rather than only
 // what the UE saw over NAS.
 func awaitSessionCount(ctx context.Context, env scenarios.Env, imsi string, want int) error {
-	cl, err := client.New(&client.Config{BaseURL: env.APIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: env.APIAddress, Token: env.APIToken})
 	if err != nil {
-		return fmt.Errorf("create core client: %w", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(env.APIToken)
 
 	deadline := time.Now().Add(10 * time.Second)
 
 	got := -1
 
 	for {
-		sub, err := cl.GetSubscriber(ctx, &client.GetSubscriberOptions{ID: imsi})
+		sub, err := cl.Subscriber(ctx, imsi)
 		if err == nil {
 			got = len(sub.Sessions)
 			if got == want {

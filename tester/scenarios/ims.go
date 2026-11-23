@@ -272,12 +272,10 @@ func RequireIMSReregistrationOnMSISDNChange(ctx context.Context, env Env, sub Su
 }
 
 func coreClient(env Env) (*client.Client, error) {
-	cl, err := client.New(&client.Config{BaseURL: env.APIAddress})
+	cl, err := EllaCoreClient(context.Background(), env.APIAddress, env.APIToken)
 	if err != nil {
-		return nil, fmt.Errorf("create core client: %w", err)
+		return nil, fmt.Errorf("reach Ella Core API: %w", err)
 	}
-
-	cl.SetToken(env.APIToken)
 
 	return cl, nil
 }

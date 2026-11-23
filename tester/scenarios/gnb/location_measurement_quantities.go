@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/ngap"
 	"github.com/ellanetworks/core/nrppa"
 	"github.com/ellanetworks/core/tester/gnb"
@@ -40,12 +39,10 @@ func runLocationMeasurementQuantitiesTest(ctx context.Context, env scenarios.Env
 		return fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := scenarios.EllaCoreClient(ctx, p.EllaAPIAddress, p.EllaAPIToken)
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("reach Ella Core API: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	g := env.FirstGNB()
 

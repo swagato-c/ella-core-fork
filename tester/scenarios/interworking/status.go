@@ -9,19 +9,17 @@ import (
 	"slices"
 	"time"
 
-	"github.com/ellanetworks/core/client"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 )
 
 const statusPoll = 200 * time.Millisecond
 
-func coreClient(env scenarios.Env) (*client.Client, error) {
-	cl, err := client.New(&client.Config{BaseURL: env.APIAddress})
+func coreClient(env scenarios.Env) (provisioning.Port, error) {
+	cl, err := provisioning.Dial(context.Background(), provisioning.Target{Address: env.APIAddress, Token: env.APIToken})
 	if err != nil {
-		return nil, fmt.Errorf("create core client: %w", err)
+		return nil, fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(env.APIToken)
 
 	return cl, nil
 }
@@ -39,7 +37,7 @@ func assertRegisteredOn(ctx context.Context, env scenarios.Env, want string) err
 	for {
 		registered := false
 
-		sub, err := cl.GetSubscriber(ctx, &client.GetSubscriberOptions{ID: interworkingIMSI})
+		sub, err := cl.Subscriber(ctx, interworkingIMSI)
 		if err == nil {
 			last = last[:0]
 

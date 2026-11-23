@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/etsi"
 	"github.com/ellanetworks/core/nas"
 	"github.com/ellanetworks/core/nas/eps"
@@ -709,7 +708,7 @@ func assertSessionOn(ctx context.Context, env scenarios.Env, want string, addrs 
 	)
 
 	for {
-		sub, err := cl.GetSubscriber(ctx, &client.GetSubscriberOptions{ID: interworkingIMSI})
+		sub, err := cl.Subscriber(ctx, interworkingIMSI)
 
 		lastErr = err
 

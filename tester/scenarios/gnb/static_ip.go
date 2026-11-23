@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/ellanetworks/core/client"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
 )
@@ -102,17 +102,15 @@ func runStaticIP(ctx context.Context, env scenarios.Env, p *staticIPParams, imsi
 // via Router Advertisement and is absent from the NAS PDU-address IE, so the
 // core's session record is the authoritative source for both families.
 func assignedSessionAddress(ctx context.Context, env scenarios.Env, imsi string, ipv6 bool) (string, error) {
-	cl, err := client.New(&client.Config{BaseURL: env.APIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: env.APIAddress, Token: env.APIToken})
 	if err != nil {
-		return "", fmt.Errorf("create core client: %w", err)
+		return "", fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(env.APIToken)
 
 	deadline := time.Now().Add(5 * time.Second)
 
 	for {
-		sub, err := cl.GetSubscriber(ctx, &client.GetSubscriberOptions{ID: imsi})
+		sub, err := cl.Subscriber(ctx, imsi)
 		if err == nil {
 			for _, s := range sub.Sessions {
 				addr := s.IPv4Address

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/s1ap"
 	"github.com/ellanetworks/core/tester/logger"
 	"github.com/ellanetworks/core/tester/s1enb"
@@ -51,12 +50,10 @@ func runS1ENBLocationIdle(ctx context.Context, env scenarios.Env, p *locationIdl
 		return fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := scenarios.EllaCoreClient(ctx, p.EllaAPIAddress, p.EllaAPIToken)
 	if err != nil {
-		return fmt.Errorf("create Ella client: %w", err)
+		return fmt.Errorf("reach Ella Core API: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	e, err := startENB(env)
 	if err != nil {

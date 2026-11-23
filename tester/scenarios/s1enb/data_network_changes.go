@@ -9,9 +9,9 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas/eps"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/s1enb"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
@@ -36,12 +36,12 @@ func init() {
 		Name:      "s1enb/data-network-mtu-change",
 		BindFlags: bindDataNetworkChangeFlags,
 		Run: func(ctx context.Context, env scenarios.Env, params any) error {
-			return runDataNetworkReactivate(ctx, env, params.(*dataNetworkChangeParams), "MTU", &client.UpdateDataNetworkOptions{
+			return runDataNetworkReactivate(ctx, env, params.(*dataNetworkChangeParams), "MTU", provisioning.DataNetwork{
 				Name:     scenarios.DefaultDNN,
 				DNS:      scenarios.DefaultDNS,
 				IPv4Pool: scenarios.DefaultUEIPv4Pool,
 				IPv6Pool: scenarios.DefaultUEIPv6Pool,
-				Mtu:      1400,
+				MTU:      1400,
 			})
 		},
 		Fixture: dataNetworkChangeFixture,
@@ -51,12 +51,12 @@ func init() {
 		Name:      "s1enb/data-network-pool-change",
 		BindFlags: bindDataNetworkChangeFlags,
 		Run: func(ctx context.Context, env scenarios.Env, params any) error {
-			return runDataNetworkReactivate(ctx, env, params.(*dataNetworkChangeParams), "IP pool", &client.UpdateDataNetworkOptions{
+			return runDataNetworkReactivate(ctx, env, params.(*dataNetworkChangeParams), "IP pool", provisioning.DataNetwork{
 				Name:     scenarios.DefaultDNN,
 				DNS:      scenarios.DefaultDNS,
 				IPv4Pool: "10.47.0.0/16",
 				IPv6Pool: scenarios.DefaultUEIPv6Pool,
-				Mtu:      scenarios.DefaultMTU,
+				MTU:      scenarios.DefaultMTU,
 			})
 		},
 		Fixture: dataNetworkChangeFixture,
@@ -82,17 +82,15 @@ func dataNetworkChangeFixture(_ scenarios.Env) scenarios.FixtureSpec {
 	}
 }
 
-func attachAndReconfigure(ctx context.Context, env scenarios.Env, p *dataNetworkChangeParams, label string, mutation *client.UpdateDataNetworkOptions) (*s1enb.ENB, *s1enb.UE, *s1enb.AttachResult, func(), error) {
+func attachAndReconfigure(ctx context.Context, env scenarios.Env, p *dataNetworkChangeParams, label string, mutation provisioning.DataNetwork) (*s1enb.ENB, *s1enb.UE, *s1enb.AttachResult, func(), error) {
 	if p.EllaAPIAddress == "" || p.EllaAPIToken == "" {
 		return nil, nil, nil, nil, fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("failed to create Ella client: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	k, opc, err := defaultKeyAndOPc()
 	if err != nil {
@@ -126,12 +124,12 @@ func attachAndReconfigure(ctx context.Context, env scenarios.Env, p *dataNetwork
 	}
 
 	cleanup := func() {
-		_ = cl.UpdateDataNetwork(context.Background(), &client.UpdateDataNetworkOptions{
+		_ = cl.UpdateDataNetwork(context.Background(), provisioning.DataNetwork{
 			Name:     scenarios.DefaultDNN,
 			DNS:      scenarios.DefaultDNS,
 			IPv4Pool: scenarios.DefaultUEIPv4Pool,
 			IPv6Pool: scenarios.DefaultUEIPv6Pool,
-			Mtu:      scenarios.DefaultMTU,
+			MTU:      scenarios.DefaultMTU,
 		})
 		_ = e.Close()
 	}
@@ -143,12 +141,12 @@ func attachAndReconfigure(ctx context.Context, env scenarios.Env, p *dataNetwork
 // REQUEST carrying the new DNS in the Protocol Configuration Options, without
 // re-establishment (TS 24.301 §6.4.2).
 func runDataNetworkDNSChange(ctx context.Context, env scenarios.Env, p *dataNetworkChangeParams) error {
-	e, ue, attach, cleanup, err := attachAndReconfigure(ctx, env, p, "DNS", &client.UpdateDataNetworkOptions{
+	e, ue, attach, cleanup, err := attachAndReconfigure(ctx, env, p, "DNS", provisioning.DataNetwork{
 		Name:     scenarios.DefaultDNN,
 		DNS:      dnChangeNewDNS,
 		IPv4Pool: scenarios.DefaultUEIPv4Pool,
 		IPv6Pool: scenarios.DefaultUEIPv6Pool,
-		Mtu:      scenarios.DefaultMTU,
+		MTU:      scenarios.DefaultMTU,
 	})
 	if err != nil {
 		return err
@@ -191,7 +189,7 @@ func runDataNetworkDNSChange(ctx context.Context, env scenarios.Env, p *dataNetw
 // An MTU or IP-pool change cannot be adopted in place. The UE's only PDN
 // connection must be re-established, so the MME detaches it with "re-attach
 // required" (TS 23.401 §5.4.4.1 step 4a) and the UE re-attaches.
-func runDataNetworkReactivate(ctx context.Context, env scenarios.Env, p *dataNetworkChangeParams, label string, mutation *client.UpdateDataNetworkOptions) error {
+func runDataNetworkReactivate(ctx context.Context, env scenarios.Env, p *dataNetworkChangeParams, label string, mutation provisioning.DataNetwork) error {
 	e, ue, attach, cleanup, err := attachAndReconfigure(ctx, env, p, label, mutation)
 	if err != nil {
 		return err

@@ -59,12 +59,10 @@ func runLocationTest(ctx context.Context, env scenarios.Env, p *locationParams) 
 	}
 
 	// Build Ella API client.
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := scenarios.EllaCoreClient(ctx, p.EllaAPIAddress, p.EllaAPIToken)
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("reach Ella Core API: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	// Start gNB.
 	g := env.FirstGNB()

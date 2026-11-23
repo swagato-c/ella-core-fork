@@ -3,9 +3,11 @@
 
 package scenarios
 
-// FixtureSpec describes everything a scenario needs provisioned on Ella Core
-// before it runs. Plain data only — no client-SDK types — so the scenarios
-// package stays free of the Ella Core REST client dependency.
+import "github.com/ellanetworks/core/tester/provisioning"
+
+// FixtureSpec describes everything a scenario needs provisioned on the core
+// before it runs, plus how the runner should invoke and check it. Plain data
+// only; the provisioning port applies it (see Provisioning).
 type FixtureSpec struct {
 	// Operator, when non-nil, overrides the baseline operator config that the
 	// integration test otherwise applies from scenarios.Default* values.
@@ -40,77 +42,34 @@ type FixtureSpec struct {
 	AssertUsageForIMSIs []string
 }
 
-type OperatorSpec struct {
-	MCC           string
-	MNC           string
-	SupportedTACs []string
-}
+// The fixture's parts are the provisioning port's own types, so a
+// FixtureSpec converts to a provisioning.Fixture without copying fields.
+type (
+	OperatorSpec       = provisioning.Operator
+	HomeNetworkKeySpec = provisioning.HomeNetworkKey
+	ProfileSpec        = provisioning.Profile
+	SliceSpec          = provisioning.Slice
+	DataNetworkSpec    = provisioning.DataNetwork
+	PolicySpec         = provisioning.Policy
+	SubscriberSpec     = provisioning.Subscriber
+	StaticIPSpec       = provisioning.StaticIP
+	FramedRouteSpec    = provisioning.FramedRoute
+)
 
-type HomeNetworkKeySpec struct {
-	KeyIdentifier int
-	Scheme        string
-	// PrivateKey is hex-encoded X25519; Core derives and serves the public key.
-	PrivateKey string
-}
-
-type ProfileSpec struct {
-	Name           string
-	UeAmbrUplink   string
-	UeAmbrDownlink string
-}
-
-type SliceSpec struct {
-	Name string
-	SST  int
-	SD   string
-}
-
-type DataNetworkSpec struct {
-	Name     string
-	IPv4Pool string
-	IPv6Pool string
-	DNS      string
-	MTU      int32
-	IMS      *bool
-}
-
-type PolicySpec struct {
-	Name                    string
-	ProfileName             string
-	SliceName               string
-	DataNetworkName         string
-	SessionAmbrUplink       string
-	SessionAmbrDownlink     string
-	Var5qi                  int32
-	Arp                     int32
-	PreemptionCapability    string
-	PreemptionVulnerability string
-}
-
-type SubscriberSpec struct {
-	IMSI           string
-	Key            string
-	OPc            string
-	SequenceNumber string
-	ProfileName    string
-	MSISDN         string
-}
-
-// StaticIPSpec pins an address to a subscriber for a data network. The IP
-// version is inferred from the address family.
-type StaticIPSpec struct {
-	IMSI        string
-	DataNetwork string
-	Address     string
-}
-
-// FramedRouteSpec provisions a subscriber's framed routes on a data network
-// (TS 23.501 §5.6.14). Families are inferred from each CIDR.
-type FramedRouteSpec struct {
-	IMSI        string
-	DataNetwork string
-	IPv4        []string
-	IPv6        []string
+// Provisioning returns the part of the spec the provisioning port applies.
+func (s FixtureSpec) Provisioning() provisioning.Fixture {
+	return provisioning.Fixture{
+		Operator:        s.Operator,
+		HomeNetworkKeys: s.HomeNetworkKeys,
+		Profiles:        s.Profiles,
+		Slices:          s.Slices,
+		DataNetworks:    s.DataNetworks,
+		Policies:        s.Policies,
+		Subscribers:     s.Subscribers,
+		StaticIPs:       s.StaticIPs,
+		FramedRoutes:    s.FramedRoutes,
+		PCSCFAddresses:  s.PCSCFAddresses,
+	}
 }
 
 func DefaultSubscriber() SubscriberSpec {

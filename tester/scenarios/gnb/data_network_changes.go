@@ -8,10 +8,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas/fgs"
 	"github.com/ellanetworks/core/tester/gnb"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/ellanetworks/core/tester/testutil/validate"
 	"github.com/spf13/pflag"
@@ -100,12 +100,10 @@ func runDataNetworkDNSChange(ctx context.Context, env scenarios.Env, p *dataNetw
 		return fmt.Errorf("--ella-api-token is required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -142,24 +140,24 @@ func runDataNetworkDNSChange(ctx context.Context, env scenarios.Env, p *dataNetw
 
 	newDNS := "1.1.1.1"
 
-	err = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+	err = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 		Name:     scenarios.DefaultDNN,
 		DNS:      newDNS,
 		IPv4Pool: scenarios.DefaultUEIPv4Pool,
 		IPv6Pool: scenarios.DefaultUEIPv6Pool,
-		Mtu:      scenarios.DefaultMTU,
+		MTU:      scenarios.DefaultMTU,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update data network DNS: %v", err)
 	}
 
 	defer func() {
-		_ = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+		_ = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 			Name:     scenarios.DefaultDNN,
 			DNS:      scenarios.DefaultDNS,
 			IPv4Pool: scenarios.DefaultUEIPv4Pool,
 			IPv6Pool: scenarios.DefaultUEIPv6Pool,
-			Mtu:      scenarios.DefaultMTU,
+			MTU:      scenarios.DefaultMTU,
 		})
 	}()
 
@@ -205,12 +203,10 @@ func runDataNetworkMTUChange(ctx context.Context, env scenarios.Env, p *dataNetw
 		return fmt.Errorf("--ella-api-token is required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -247,24 +243,24 @@ func runDataNetworkMTUChange(ctx context.Context, env scenarios.Env, p *dataNetw
 
 	newMTU := int32(1400)
 
-	err = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+	err = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 		Name:     scenarios.DefaultDNN,
 		DNS:      scenarios.DefaultDNS,
 		IPv4Pool: scenarios.DefaultUEIPv4Pool,
 		IPv6Pool: scenarios.DefaultUEIPv6Pool,
-		Mtu:      newMTU,
+		MTU:      newMTU,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update data network MTU: %v", err)
 	}
 
 	defer func() {
-		_ = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+		_ = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 			Name:     scenarios.DefaultDNN,
 			DNS:      scenarios.DefaultDNS,
 			IPv4Pool: scenarios.DefaultUEIPv4Pool,
 			IPv6Pool: scenarios.DefaultUEIPv6Pool,
-			Mtu:      scenarios.DefaultMTU,
+			MTU:      scenarios.DefaultMTU,
 		})
 	}()
 
@@ -312,12 +308,10 @@ func runDataNetworkPoolChange(ctx context.Context, env scenarios.Env, p *dataNet
 		return fmt.Errorf("--ella-api-token is required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -354,24 +348,24 @@ func runDataNetworkPoolChange(ctx context.Context, env scenarios.Env, p *dataNet
 
 	newIPv4Pool := "10.46.0.0/16"
 
-	err = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+	err = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 		Name:     scenarios.DefaultDNN,
 		DNS:      scenarios.DefaultDNS,
 		IPv4Pool: newIPv4Pool,
 		IPv6Pool: scenarios.DefaultUEIPv6Pool,
-		Mtu:      scenarios.DefaultMTU,
+		MTU:      scenarios.DefaultMTU,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to update data network IP pool: %v", err)
 	}
 
 	defer func() {
-		_ = cl.UpdateDataNetwork(ctx, &client.UpdateDataNetworkOptions{
+		_ = cl.UpdateDataNetwork(ctx, provisioning.DataNetwork{
 			Name:     scenarios.DefaultDNN,
 			DNS:      scenarios.DefaultDNS,
 			IPv4Pool: scenarios.DefaultUEIPv4Pool,
 			IPv6Pool: scenarios.DefaultUEIPv6Pool,
-			Mtu:      scenarios.DefaultMTU,
+			MTU:      scenarios.DefaultMTU,
 		})
 	}()
 

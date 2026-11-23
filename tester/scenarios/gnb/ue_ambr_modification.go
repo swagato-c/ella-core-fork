@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
 )
@@ -57,12 +57,10 @@ func runUEAMBRModification(ctx context.Context, env scenarios.Env, p *sessionMod
 		return fmt.Errorf("--ella-api-address and --ella-api-token are required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %w", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -86,7 +84,8 @@ func runUEAMBRModification(ctx context.Context, env scenarios.Env, p *sessionMod
 
 	time.Sleep(2 * time.Second)
 
-	if err := cl.UpdateProfile(ctx, ueAMBRModProfile, &client.UpdateProfileOptions{
+	if err := cl.UpdateProfile(ctx, provisioning.Profile{
+		Name:           ueAMBRModProfile,
 		UeAmbrUplink:   "40 Mbps",
 		UeAmbrDownlink: "60 Mbps",
 	}); err != nil {

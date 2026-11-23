@@ -370,7 +370,7 @@ func runNRNotGranted(env scenarios.Env, imsi string) error {
 }
 
 func withSMSDisabled(ctx context.Context, env scenarios.Env, during func() error) error {
-	cl, err := client.New(&client.Config{BaseURL: env.APIAddress, APIToken: env.APIToken})
+	cl, err := scenarios.EllaCoreClient(ctx, env.APIAddress, env.APIToken)
 	if err != nil {
 		return err
 	}

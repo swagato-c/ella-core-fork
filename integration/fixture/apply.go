@@ -4,13 +4,12 @@
 package fixture
 
 import (
-	"strings"
-
-	"github.com/ellanetworks/core/client"
+	"github.com/ellanetworks/core/tester/provisioning/ellacore"
 	"github.com/ellanetworks/core/tester/scenarios"
 )
 
-// Apply provisions every scenario-owned resource in spec and registers
+// Apply provisions every scenario-owned resource in spec through the
+// provisioning port's Ella Core adapter, and registers
 // t.Cleanup handlers to delete them when the subtest ends. LIFO cleanup
 // order gives the correct reverse-dependency teardown: subscribers,
 // policies, data networks, slices, profiles.
@@ -29,229 +28,14 @@ import (
 func (f *F) Apply(spec scenarios.FixtureSpec) {
 	f.t.Helper()
 
-	if spec.Operator != nil {
-		f.Operator(OperatorSpec{
-			MCC:           spec.Operator.MCC,
-			MNC:           spec.Operator.MNC,
-			SupportedTACs: spec.Operator.SupportedTACs,
-		})
-	}
-
-	for _, k := range spec.HomeNetworkKeys {
-		f.HomeNetworkKey(HomeNetworkKeySpec{
-			KeyIdentifier: k.KeyIdentifier,
-			Scheme:        k.Scheme,
-			PrivateKey:    k.PrivateKey,
-		})
-	}
-
-	for _, p := range spec.Profiles {
-		f.scopedProfile(p)
-	}
-
-	for _, s := range spec.Slices {
-		f.scopedSlice(s)
-	}
-
-	for _, dn := range spec.DataNetworks {
-		f.scopedDataNetwork(dn)
-	}
-
-	for _, p := range spec.Policies {
-		f.scopedPolicy(p)
-	}
-
-	for _, s := range spec.Subscribers {
-		f.scopedSubscriber(s)
-	}
-
-	for _, s := range spec.StaticIPs {
-		f.scopedStaticIP(s)
-	}
-
-	for _, fr := range spec.FramedRoutes {
-		f.scopedFramedRoute(fr)
-	}
-
-	if len(spec.PCSCFAddresses) > 0 {
-		f.scopedPCSCFAddresses(spec.PCSCFAddresses)
-	}
-}
-
-func (f *F) scopedPCSCFAddresses(addresses []string) {
-	f.t.Helper()
-
-	current, err := f.c.GetIMSSettings(f.ctx)
+	teardown, err := ellacore.New(f.c).Apply(f.ctx, spec.Provisioning())
 	if err != nil {
-		f.fatalf("get IMS settings: %v", err)
-	}
-
-	if err := f.c.UpdateIMSSettings(f.ctx, &client.UpdateIMSSettingsOptions{PCSCFAddresses: addresses, HomeDomain: current.HomeDomain, AdvertiseVoice: current.AdvertiseVoice, RestrictPeers: current.RestrictPeers}); err != nil {
-		f.fatalf("set P-CSCF addresses %v: %v", addresses, err)
+		f.fatalf("apply fixture through the provisioning port: %v", err)
 	}
 
 	f.t.Cleanup(func() {
-		if err := f.c.UpdateIMSSettings(f.ctx, &client.UpdateIMSSettingsOptions{HomeDomain: current.HomeDomain, AdvertiseVoice: current.AdvertiseVoice, RestrictPeers: current.RestrictPeers}); err != nil {
-			f.t.Logf("cleanup: clear P-CSCF addresses: %v", err)
-		}
-	})
-}
-
-func (f *F) scopedFramedRoute(spec scenarios.FramedRouteSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateDataNetworkFramedRoute(f.ctx, spec.DataNetwork, &client.CreateFramedRouteOptions{
-		IMSI: spec.IMSI,
-		IPv4: spec.IPv4,
-		IPv6: spec.IPv6,
-	}); err != nil {
-		f.fatalf("create framed routes for %s on %s: %v", spec.IMSI, spec.DataNetwork, err)
-	}
-
-	dn, imsi := spec.DataNetwork, spec.IMSI
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteDataNetworkFramedRoute(f.ctx, dn, imsi); err != nil {
-			f.t.Logf("cleanup: delete framed routes for %s on %s: %v", imsi, dn, err)
-		}
-	})
-}
-
-func (f *F) scopedStaticIP(spec scenarios.StaticIPSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateDataNetworkStaticIp(f.ctx, spec.DataNetwork, &client.CreateStaticIPOptions{
-		IMSI:    spec.IMSI,
-		Address: spec.Address,
-	}); err != nil {
-		f.fatalf("create static IP %s for %s: %v", spec.Address, spec.IMSI, err)
-	}
-
-	dn, imsi, addr := spec.DataNetwork, spec.IMSI, spec.Address
-
-	ipVersion := "ipv4"
-	if strings.Contains(addr, ":") {
-		ipVersion = "ipv6"
-	}
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteDataNetworkStaticIp(f.ctx, dn, imsi, ipVersion); err != nil {
-			f.t.Logf("cleanup: delete static IP %s for %s: %v", addr, imsi, err)
-		}
-	})
-}
-
-func (f *F) scopedProfile(spec scenarios.ProfileSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateProfile(f.ctx, &client.CreateProfileOptions{
-		Name:           spec.Name,
-		UeAmbrUplink:   spec.UeAmbrUplink,
-		UeAmbrDownlink: spec.UeAmbrDownlink,
-	}); err != nil {
-		f.fatalf("create scoped profile %q: %v", spec.Name, err)
-	}
-
-	name := spec.Name
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteProfile(f.ctx, &client.DeleteProfileOptions{Name: name}); err != nil {
-			f.t.Logf("cleanup: delete profile %q: %v", name, err)
-		}
-	})
-}
-
-func (f *F) scopedSlice(spec scenarios.SliceSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateSlice(f.ctx, &client.CreateSliceOptions{
-		Name: spec.Name,
-		Sst:  spec.SST,
-		Sd:   spec.SD,
-	}); err != nil {
-		f.fatalf("create scoped slice %q: %v", spec.Name, err)
-	}
-
-	name := spec.Name
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteSlice(f.ctx, &client.DeleteSliceOptions{Name: name}); err != nil {
-			f.t.Logf("cleanup: delete slice %q: %v", name, err)
-		}
-	})
-}
-
-func (f *F) scopedDataNetwork(spec scenarios.DataNetworkSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateDataNetwork(f.ctx, &client.CreateDataNetworkOptions{
-		Name:     spec.Name,
-		IPv4Pool: spec.IPv4Pool,
-		IPv6Pool: spec.IPv6Pool,
-		DNS:      spec.DNS,
-		Mtu:      spec.MTU,
-		IMS:      spec.IMS,
-	}); err != nil {
-		f.fatalf("create scoped data network %q: %v", spec.Name, err)
-	}
-
-	name := spec.Name
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteDataNetwork(f.ctx, &client.DeleteDataNetworkOptions{Name: name}); err != nil {
-			f.t.Logf("cleanup: delete data network %q: %v", name, err)
-		}
-	})
-}
-
-func (f *F) scopedPolicy(spec scenarios.PolicySpec) {
-	f.t.Helper()
-
-	f.serveDataNetwork(spec.SliceName, spec.DataNetworkName)
-
-	if err := f.c.CreatePolicy(f.ctx, &client.CreatePolicyOptions{
-		Name:                    spec.Name,
-		ProfileName:             spec.ProfileName,
-		SliceName:               spec.SliceName,
-		DataNetworkName:         spec.DataNetworkName,
-		SessionAmbrUplink:       spec.SessionAmbrUplink,
-		SessionAmbrDownlink:     spec.SessionAmbrDownlink,
-		Var5qi:                  spec.Var5qi,
-		Arp:                     spec.Arp,
-		PreemptionCapability:    spec.PreemptionCapability,
-		PreemptionVulnerability: spec.PreemptionVulnerability,
-	}); err != nil {
-		f.fatalf("create scoped policy %q: %v", spec.Name, err)
-	}
-
-	name := spec.Name
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeletePolicy(f.ctx, &client.DeletePolicyOptions{Name: name}); err != nil {
-			f.t.Logf("cleanup: delete policy %q: %v", name, err)
-		}
-	})
-}
-
-func (f *F) scopedSubscriber(spec scenarios.SubscriberSpec) {
-	f.t.Helper()
-
-	if err := f.c.CreateSubscriber(f.ctx, &client.CreateSubscriberOptions{
-		Imsi:           spec.IMSI,
-		Key:            spec.Key,
-		SequenceNumber: spec.SequenceNumber,
-		ProfileName:    spec.ProfileName,
-		OPc:            spec.OPc,
-		Msisdn:         spec.MSISDN,
-	}); err != nil {
-		f.fatalf("create scoped subscriber %q: %v", spec.IMSI, err)
-	}
-
-	imsi := spec.IMSI
-
-	f.t.Cleanup(func() {
-		if err := f.c.DeleteSubscriber(f.ctx, &client.DeleteSubscriberOptions{ID: imsi}); err != nil {
-			f.t.Logf("cleanup: delete subscriber %q: %v", imsi, err)
+		if err := teardown(f.ctx); err != nil {
+			f.t.Logf("cleanup: %v", err)
 		}
 	})
 }

@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ellanetworks/core/client"
 	"github.com/ellanetworks/core/nas/fgs"
 	"github.com/ellanetworks/core/ngap"
 	"github.com/ellanetworks/core/tester/gnb"
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
 	"github.com/ellanetworks/core/tester/scenarios"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
@@ -80,12 +80,10 @@ func runSliceMismatchRelease(ctx context.Context, env scenarios.Env, p *sliceMis
 		return fmt.Errorf("--ella-api-token is required")
 	}
 
-	cl, err := client.New(&client.Config{BaseURL: p.EllaAPIAddress})
+	cl, err := provisioning.Dial(ctx, provisioning.Target{Address: p.EllaAPIAddress, Token: p.EllaAPIToken})
 	if err != nil {
-		return fmt.Errorf("failed to create Ella client: %v", err)
+		return fmt.Errorf("open provisioning port: %w", err)
 	}
-
-	cl.SetToken(p.EllaAPIToken)
 
 	gNodeB, err := startGNB(env)
 	if err != nil {
@@ -127,7 +125,8 @@ func runSliceMismatchRelease(ctx context.Context, env scenarios.Env, p *sliceMis
 		zap.String("IMSI", sub.IMSI),
 	)
 
-	err = cl.UpdateSubscriber(ctx, sub.IMSI, &client.UpdateSubscriberOptions{
+	err = cl.UpdateSubscriber(ctx, provisioning.SubscriberUpdate{
+		IMSI:        sub.IMSI,
 		ProfileName: "alternate",
 	})
 	if err != nil {
@@ -167,7 +166,8 @@ func runSliceMismatchRelease(ctx context.Context, env scenarios.Env, p *sliceMis
 		zap.Stringer("cause", cause),
 	)
 
-	_ = cl.UpdateSubscriber(ctx, sub.IMSI, &client.UpdateSubscriberOptions{
+	_ = cl.UpdateSubscriber(ctx, provisioning.SubscriberUpdate{
+		IMSI:        sub.IMSI,
 		ProfileName: scenarios.DefaultProfileName,
 	})
 

@@ -12,6 +12,8 @@ import (
 	"syscall"
 
 	"github.com/ellanetworks/core/tester/logger"
+	"github.com/ellanetworks/core/tester/provisioning"
+	"github.com/ellanetworks/core/tester/provisioning/ellacore"
 	"github.com/ellanetworks/core/tester/scenarios"
 	// Register all scenarios.
 	_ "github.com/ellanetworks/core/tester/scenarios/all"
@@ -32,6 +34,10 @@ var (
 )
 
 func main() {
+	// Scenarios reach the core through the provisioning port; this binary
+	// provisions Ella Core.
+	provisioning.Use(ellacore.Open)
+
 	rootCmd := &cobra.Command{
 		Use:   "core-tester",
 		Short: "Ella Core RAN/UE scenario runner",
